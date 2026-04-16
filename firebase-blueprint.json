@@ -1,0 +1,94 @@
+{
+  "entities": {
+    "Vehicle": {
+      "title": "Vehicle",
+      "description": "Information about a vehicle in the fleet",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "plate": { "type": "string" },
+        "photoUrl": { "type": "string" },
+        "pin": { "type": "string" }
+      },
+      "required": ["id", "name", "plate"]
+    },
+    "ServiceEntry": {
+      "title": "Service Entry",
+      "description": "A single service performed by a vehicle",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "date": { "type": "string", "format": "date" },
+        "type": { "type": "string", "enum": ["normal", "casada", "milho", "cimento", "armazem", "boa_vista", "gas", "frete_avulso"] },
+        "quantity": { "type": "number" },
+        "unitPrice": { "type": "number" },
+        "driverPayment": { "type": "number" },
+        "containerSize": { "type": "string" },
+        "overtimeHours": { "type": "number" }
+      },
+      "required": ["id", "date", "type", "quantity"]
+    },
+    "MonthlyCosts": {
+      "title": "Monthly Costs",
+      "description": "Operational costs for a vehicle in a specific month",
+      "type": "object",
+      "properties": {
+        "dieselLiters": { "type": "number" },
+        "dieselPrice": { "type": "number" },
+        "driverDays": { "type": "number" },
+        "driverDailyRate": { "type": "number" },
+        "taxRate": { "type": "number" },
+        "maintenanceParts": { "type": "number" },
+        "maintenanceLabor": { "type": "number" },
+        "overtimeHours": { "type": "number" },
+        "overtimeRate": { "type": "number" }
+      }
+    },
+    "MonthRecord": {
+      "title": "Month Record",
+      "description": "Consolidated record of services and costs for a vehicle in a month",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "vehicleId": { "type": "string" },
+        "month": { "type": "number" },
+        "year": { "type": "number" },
+        "services": { 
+          "type": "array",
+          "items": { "$ref": "#/entities/ServiceEntry" }
+        },
+        "costs": { "$ref": "#/entities/MonthlyCosts" }
+      },
+      "required": ["id", "vehicleId", "month", "year", "services", "costs"]
+    },
+    "CompanySettings": {
+      "title": "Company Settings",
+      "description": "General settings for the company",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "cnpj": { "type": "string" },
+        "address": { "type": "string" },
+        "phone": { "type": "string" },
+        "email": { "type": "string" },
+        "logoUrl": { "type": "string" }
+      },
+      "required": ["name"]
+    }
+  },
+  "firestore": {
+    "/vehicles/{vehicleId}": {
+      "schema": "Vehicle",
+      "description": "Collection of vehicles"
+    },
+    "/records/{recordId}": {
+      "schema": "MonthRecord",
+      "description": "Collection of monthly records"
+    },
+    "/settings/company": {
+      "schema": "CompanySettings",
+      "description": "Company settings document"
+    }
+  }
+}

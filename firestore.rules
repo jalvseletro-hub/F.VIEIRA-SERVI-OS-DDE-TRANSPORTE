@@ -1,0 +1,102 @@
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: vehicles
+// Document ID: vehicleId
+// Fields:
+//   - id: string (required)
+//   - name: string (required)
+//   - plate: string (required)
+//   - photoUrl: string (optional)
+//   - pin: string (optional)
+//
+// Collection: records
+// Document ID: recordId
+// Fields:
+//   - id: string (required)
+//   - vehicleId: string (required)
+//   - month: number (required)
+//   - year: number (required)
+//   - services: list (required) - Array of ServiceEntry objects (id, date, type, quantity, unitPrice, driverPayment, containerSize, gasItems, helperCost, lunchCost, portCost, dieselLiters, overtimeHours)
+//   - costs: map (required) - MonthlyCosts object (dieselLiters, dieselPrice, driverDays, driverDailyRate, taxRate, maintenanceParts, maintenanceLabor, overtimeHours, overtimeRate)
+//
+// Collection: settings
+// Document ID: company
+// Fields:
+//   - name: string (required)
+//   - cnpj: string (optional)
+//   - address: string (optional)
+//   - phone: string (optional)
+//   - email: string (optional)
+//   - logoUrl: string (optional)
+//
+// ===============================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+// Helper Functions
+// ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (request.auth.token.email == "jalvs.eletro@gmail.com" && request.auth.token.email_verified == true);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function isValidVehicle(data) {
+      return data.id is string && data.id.size() > 0 &&
+             data.name is string && data.name.size() > 0 && data.name.size() < 100 &&
+             data.plate is string && data.plate.size() > 0 && data.plate.size() < 20;
+    }
+
+    function isValidRecord(data) {
+      return data.id is string &&
+             data.vehicleId is string &&
+             data.month is number && data.month >= 0 && data.month <= 11 &&
+             data.year is number && data.year >= 2000 &&
+             data.services is list &&
+             data.costs is map;
+    }
+
+    function isValidSettings(data) {
+      return data.name is string && data.name.size() > 0 && data.name.size() < 100;
+    }
+
+    // ===============================================================
+// Rules
+// ===============================================================
+
+    match /vehicles/{vehicleId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() && isValidVehicle(request.resource.data);
+    }
+
+    match /records/{recordId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isValidRecord(request.resource.data);
+      allow update: if isAuthenticated() && isValidRecord(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /settings/{settingId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() && isValidSettings(request.resource.data);
+    }
+
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

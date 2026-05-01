@@ -18,7 +18,8 @@ import {
   Upload,
   LogIn,
   LogOut,
-  RefreshCw
+  RefreshCw,
+  Building2
 } from 'lucide-react';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
@@ -73,7 +74,7 @@ import {
 // Pre-populated data
 const DEFAULT_DIESEL_PRICE = 6.50;
 const INITIAL_SETTINGS: CompanySettings = {
-  name: 'MicroServic',
+  name: 'F.VIEIRA',
   cnpj: '',
   address: '',
   phone: '',
@@ -91,17 +92,17 @@ const PRICES = {
   normal: 450,
   milho: 0, // Manual price
   cimento: 0, // Manual price
-  armazem: 450, // Legacy support
   boa_vista: 11000,
   gas: 0, // Manual price for revenue
-  frete_avulso: 0 // Manual price
+  frete_avulso: 0, // Manual price
+  aleatorio: 0 // Manual price
 };
 
 const getServiceRevenue = (s: ServiceEntry) => {
   if (s.type === 'gas' && s.gasItems && s.gasItems.length > 0) {
     return s.gasItems.reduce((acc, item) => acc + (item.quantity * item.unitPrice), 0);
   }
-  const price = (s.type === 'milho' || s.type === 'cimento' || s.type === 'gas' || s.type === 'frete_avulso') ? (s.unitPrice || 0) : PRICES[s.type as keyof typeof PRICES];
+  const price = (s.type === 'milho' || s.type === 'cimento' || s.type === 'gas' || s.type === 'frete_avulso' || s.type === 'aleatorio') ? (s.unitPrice || 0) : PRICES[s.type as keyof typeof PRICES];
   return s.quantity * price;
 };
 
@@ -187,10 +188,12 @@ export default function App() {
   const isDataReady = forceReady || (dataLoaded.vehicles && dataLoaded.records && dataLoaded.settings);
 
   const [activeTab, setActiveTab] = useState<'dashboard' | 'history' | 'vehicles' | 'settings'>('dashboard');
+  const [userRole, setUserRole] = useState<'none' | 'admin' | 'driver'>('none');
   const [currentUserVehicleId, setCurrentUserVehicleId] = useState<string | null>(() => {
     return localStorage.getItem('ms_current_user_vehicle_id');
   });
-  const [pinToVerify, setPinToVerify] = useState<string | null>(null);
+  const [plateInput, setPlateInput] = useState('');
+  const [accessError, setAccessError] = useState('');
   const [selectedVehicleId, setSelectedVehicleId] = useState<string>(INITIAL_VEHICLE_ID);
   const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null);
   const [showRecordModal, setShowRecordModal] = useState(false);
@@ -204,20 +207,34 @@ export default function App() {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
       setUser(user);
       setIsAuthReady(true);
+      
+      if (user && user.email?.toLowerCase() === 'jalvs.eletro@gmail.com') {
+        setUserRole('admin');
+      } else if (currentUserVehicleId) {
+        setUserRole('driver');
+      } else {
+        setUserRole('none');
+      }
     });
     return () => unsubscribe();
-  }, []);
+  }, [currentUserVehicleId]);
 
-  // Firestore Sync
+  const isAdmin = userRole === 'admin';
+  const isDriver = userRole === 'driver';
   useEffect(() => {
     if (!user) return;
 
     const unsubVehicles = onSnapshot(collection(db, 'vehicles'), (snapshot) => {
       const data = snapshot.docs.map(doc => doc.data() as Vehicle);
       setVehicles(data);
-      if (data.length > 0 && (!selectedVehicleId || !data.find(v => v.id === selectedVehicleId))) {
+      
+      // Lock selection for drivers
+      if (currentUserVehicleId) {
+        setSelectedVehicleId(currentUserVehicleId);
+      } else if (data.length > 0 && !selectedVehicleId) {
         setSelectedVehicleId(data[0].id);
       }
+      
       setDataLoaded(prev => ({ ...prev, vehicles: true }));
     }, (error) => handleFirestoreError(error, OperationType.LIST, 'vehicles', false));
 
@@ -243,7 +260,6 @@ export default function App() {
 
   // Migration Logic (Only for Admin)
   const currentUserVehicle = vehicles.find(v => v.id === currentUserVehicleId);
-  const isAdmin = user?.email?.toLowerCase() === 'jalvs.eletro@gmail.com' || currentUserVehicle?.plate === 'QZB7G36';
 
   const migrateData = async () => {
     if (!isAdmin || isMigrating) return;
@@ -314,10 +330,24 @@ export default function App() {
     }
   };
 
+  const handlePlateAccess = () => {
+    const v = vehicles.find(v => v.plate.toLowerCase() === plateInput.trim().toLowerCase());
+    if (v) {
+      setCurrentUserVehicleId(v.id);
+      setUserRole('driver');
+      setAccessError('');
+      setActiveTab('dashboard');
+    } else {
+      setAccessError('Veículo não encontrado. Verifique a placa.');
+    }
+  };
+
   const handleLogout = async () => {
     try {
       await signOut(auth);
       setCurrentUserVehicleId(null);
+      setUserRole('none');
+      setPlateInput('');
     } catch (error) {
       console.error('Logout failed', error);
     }
@@ -349,16 +379,52 @@ export default function App() {
 
     const diesel = record.costs.dieselLiters * record.costs.dieselPrice;
     
-    // Driver costs: daily rate for normal days + specific trip payments (like Boa Vista)
-    const driverBase = record.costs.driverDays * record.costs.driverDailyRate;
-    const tripPayments = record.services.reduce((acc, s) => acc + (s.driverPayment || 0), 0);
+    // Driver stats calculation per driver
+    const getDriverStats = (dId: number) => {
+      const driverServices = record.services.filter(s => (s.driverId || 1) === dId);
+      const uniqueDates = Array.from(new Set(driverServices.map(s => s.date)));
+      
+      let totalCost = 0;
+      uniqueDates.forEach(date => {
+        const dayServices = driverServices.filter(s => s.date === date);
+        const dayCustomPayment = dayServices.reduce((acc, s) => acc + (s.driverPayment || 0), 0);
+        
+        // Cost for this day is the cumulative custom payment if provided, otherwise the daily rate
+        totalCost += dayCustomPayment > 0 ? dayCustomPayment : record.costs.driverDailyRate;
+      });
+      
+      return {
+        days: uniqueDates.length,
+        cost: totalCost
+      };
+    };
+
+    const d1Stats = getDriverStats(1);
+    const d2Stats = getDriverStats(2);
+    
+    const driver1Days = d1Stats.days;
+    const driver2Days = d2Stats.days;
+    const driver1TotalCost = d1Stats.cost;
+    const driver2TotalCost = d2Stats.cost;
+
+    // Use manual driverDays fallback if no days calculated from services
+    const totalDriverDaysCalculated = driver1Days + driver2Days;
+    const effectiveDriverDays = totalDriverDaysCalculated > 0 ? totalDriverDaysCalculated : record.costs.driverDays;
+    
     const overtime = (record.costs.overtimeHours || 0) * (record.costs.overtimeRate || 0);
-    const driver = driverBase + overtime + tripPayments;
+    
+    // Total driver balance (standard/custom days + overtime)
+    const driverBase = totalDriverDaysCalculated > 0 ? (driver1TotalCost + driver2TotalCost) : (record.costs.driverDays * record.costs.driverDailyRate);
+    const driver = driverBase + overtime;
     
     const maintenance = record.costs.maintenanceParts + record.costs.maintenanceLabor;
     const vehicle = vehicles.find(v => v.id === record.vehicleId);
     const isAtego = vehicle?.name.includes('Atego 2425');
-    const extraCosts = isAtego ? record.services.reduce((acc, s) => acc + (s.helperCost || 0) + (s.lunchCost || 0) + (s.portCost || 0), 0) : 0;
+    
+    const agentCommissions = record.services.reduce((acc, s) => acc + (s.agentCommission || 0), 0);
+    const ategoExtras = isAtego ? record.services.reduce((acc, s) => acc + (s.helperCost || 0) + (s.lunchCost || 0) + (s.portCost || 0), 0) : 0;
+    const extraCosts = ategoExtras + agentCommissions;
+
     const taxes = (taxableRevenue * record.costs.taxRate) / 100;
     const total = diesel + driver + maintenance + taxes + extraCosts;
     const profit = revenue - total;
@@ -368,9 +434,14 @@ export default function App() {
       diesel,
       driver,
       driverBase,
+      driver1Days,
+      driver2Days,
+      driver1TotalCost,
+      driver2TotalCost,
       overtime,
       maintenance,
       extraCosts,
+      agentCommissions,
       taxes,
       total,
       profit,
@@ -444,22 +515,71 @@ export default function App() {
     doc.text(`Placa: ${vehicle?.plate || 'N/A'}`, 14, infoY + 7);
     doc.text(`Período: ${monthName}`, 14, infoY + 14);
 
+    let nextY = infoY + 25;
+
+    // Client Info (if available)
+    if (record.client) {
+      doc.setFontSize(12);
+      doc.setTextColor(15, 23, 42);
+      doc.text('Dados do Cliente:', 120, infoY);
+      doc.setFontSize(10);
+      doc.setTextColor(100, 116, 139);
+      let clientY = infoY + 7;
+      doc.text(`Empresa: ${record.client.name}`, 120, clientY);
+      if (record.client.cnpj) { clientY += 5; doc.text(`CNPJ: ${record.client.cnpj}`, 120, clientY); }
+      if (record.client.contactName) { clientY += 5; doc.text(`Contato: ${record.client.contactName}`, 120, clientY); }
+      if (record.client.phone) { clientY += 5; doc.text(`Tel: ${record.client.phone}`, 120, clientY); }
+      if (record.client.email) { clientY += 5; doc.text(`E-mail: ${record.client.email}`, 120, clientY); }
+      if (record.client.address) { 
+        clientY += 5; 
+        const splitAddress = doc.splitTextToSize(`End: ${record.client.address}`, 80);
+        doc.text(splitAddress, 120, clientY);
+        clientY += (splitAddress.length * 5);
+      }
+      nextY = Math.max(nextY, clientY + 10);
+    }
+
     // Summary Table
+    const summaryRows = [
+      ['Receita Bruta', formatCurrency(revenue)],
+      ['Diesel', formatCurrency(stats.diesel)],
+    ];
+
+    if (stats.driver1Days > 0 || stats.driver2Days > 0) {
+      if (stats.driver1Days > 0) {
+        summaryRows.push([`Diárias Motorista 1 (${stats.driver1Days} dias)`, formatCurrency(stats.driver1TotalCost)]);
+      }
+      if (stats.driver2Days > 0) {
+        summaryRows.push([`Diárias Motorista 2 (${stats.driver2Days} dias)`, formatCurrency(stats.driver2TotalCost)]);
+      }
+    } else {
+      summaryRows.push([`Diárias Motorista (${record.costs.driverDays} dias)`, formatCurrency(stats.driverBase)]);
+    }
+
+    summaryRows.push(['Horas Extras', formatCurrency(stats.overtime)]);
+    summaryRows.push(['Manutenção', formatCurrency(stats.maintenance)]);
+    summaryRows.push(['Impostos (Exceto Milho)', formatCurrency(stats.taxes)]);
+
+    const isAtego = vehicle?.name.includes('Atego 2425');
+    if (isAtego) {
+      const ategoExtras = record.services.reduce((acc, s) => acc + (s.helperCost || 0) + (s.lunchCost || 0) + (s.portCost || 0), 0);
+      if (ategoExtras > 0) {
+        summaryRows.push(['Custos Extras (Ajudante/Almoço/Porto)', formatCurrency(ategoExtras)]);
+      }
+    }
+
+    if (stats.agentCommissions > 0) {
+      summaryRows.push(['Comissão Agenciador (Milho)', formatCurrency(stats.agentCommissions)]);
+    }
+
+    summaryRows.push(['Custo Total', formatCurrency(stats.total)]);
+    summaryRows.push(['Lucro Líquido', formatCurrency(stats.profit)]);
+    summaryRows.push(['Margem de Lucro', `${stats.margin.toFixed(2)}%`]);
+
     autoTable(doc, {
-      startY: infoY + 25,
+      startY: nextY,
       head: [['Descrição', 'Valor']],
-      body: [
-        ['Receita Bruta', formatCurrency(revenue)],
-        ['Diesel', formatCurrency(stats.diesel)],
-        ['Diárias Motorista', formatCurrency(stats.driverBase)],
-        ['Horas Extras', formatCurrency(stats.overtime)],
-        ['Manutenção', formatCurrency(stats.maintenance)],
-        ['Impostos (Exceto Milho)', formatCurrency(stats.taxes)],
-        ...(vehicle?.name.includes('Atego 2425') ? [['Custos Extras (Ajudante/Almoço/Porto)', formatCurrency(stats.extraCosts)]] : []),
-        ['Custo Total', formatCurrency(stats.total)],
-        ['Lucro Líquido', formatCurrency(stats.profit)],
-        ['Margem de Lucro', `${stats.margin.toFixed(2)}%`],
-      ],
+      body: summaryRows,
       theme: 'striped',
       headStyles: { fillColor: [79, 70, 229] },
     });
@@ -470,24 +590,283 @@ export default function App() {
 
     autoTable(doc, {
       startY: (doc as any).lastAutoTable.finalY + 20,
-      head: [['Data', 'Tipo', 'Qtd', 'Valor Unit.', 'Total']],
-      body: record.services.map(s => [
-        format(parseISO(s.date), 'dd/MM/yyyy'),
-        s.type === 'casada' ? 'Casada' : 
-        s.type === 'normal' || s.type === 'armazem' ? 'Normal' : 
-        s.type === 'milho' ? 'Milho' : 
-        s.type === 'cimento' ? 'Cimento' : 
-        s.type === 'boa_vista' ? 'Boa Vista' : 
-        s.type === 'gas' ? 'Gás' : 'Frete Avulso',
-        s.quantity + (s.overtimeHours ? ` (+${s.overtimeHours}h extra)` : ''),
-        formatCurrency((s.type === 'milho' || s.type === 'cimento' || s.type === 'gas' || s.type === 'frete_avulso') ? (s.unitPrice || 0) : PRICES[s.type]),
-        formatCurrency(s.quantity * ((s.type === 'milho' || s.type === 'cimento' || s.type === 'gas' || s.type === 'frete_avulso') ? (s.unitPrice || 0) : PRICES[s.type]))
-      ]),
+      head: [['Data', 'Tipo', 'Motor.', 'Qtd', 'Valor Unit.', 'Total']],
+      body: record.services.map(s => {
+        const typeStr = (s.type === 'casada' ? 'Casada' : 
+                        s.type === 'normal' ? 'Normal' : 
+                        s.type === 'milho' ? 'Milho' : 
+                        s.type === 'cimento' ? 'Cimento' : 
+                        s.type === 'boa_vista' ? 'Boa Vista' : 
+                        s.type === 'gas' ? 'Gás' : 
+                        s.type === 'aleatorio' ? 'Aleatório' : 'Frete Avulso') + 
+                        (s.agentCommission ? `\n(Comis: ${formatCurrency(s.agentCommission)})` : '') +
+                        (s.observation ? `\nObs: ${s.observation}` : '');
+        
+        return [
+          format(parseISO(s.date), 'dd/MM/yyyy'),
+          typeStr,
+          s.driverId || 1,
+          s.quantity + (s.overtimeHours ? ` (+${s.overtimeHours}h extra)` : ''),
+          formatCurrency((s.type === 'milho' || s.type === 'cimento' || s.type === 'gas' || s.type === 'frete_avulso' || s.type === 'aleatorio') ? (s.unitPrice || 0) : PRICES[s.type]),
+          formatCurrency(s.quantity * ((s.type === 'milho' || s.type === 'cimento' || s.type === 'gas' || s.type === 'frete_avulso' || s.type === 'aleatorio') ? (s.unitPrice || 0) : PRICES[s.type]))
+        ];
+      }),
       theme: 'grid',
       headStyles: { fillColor: [71, 85, 105] },
+      columnStyles: {
+        2: { halign: 'center' }
+      }
     });
 
+    // Service Summary Table
+    const serviceSummary = record.services.reduce((acc: any, s) => {
+      const type = s.type;
+      if (!acc[type]) acc[type] = { count: 0, quantity: 0, revenue: 0, details: {} };
+      acc[type].count += 1;
+      acc[type].quantity += s.quantity;
+      
+      const price = (type === 'milho' || type === 'cimento' || type === 'gas' || type === 'frete_avulso') 
+        ? (s.unitPrice || 0) 
+        : PRICES[type];
+      acc[type].revenue += (s.quantity * price);
+      
+      if (type === 'gas') {
+        if (s.gasItems) {
+          s.gasItems.forEach(item => {
+            acc[type].details[item.size] = (acc[type].details[item.size] || 0) + item.quantity;
+          });
+        } else if (s.containerSize) {
+          acc[type].details[s.containerSize] = (acc[type].details[s.containerSize] || 0) + s.quantity;
+        }
+      }
+      return acc;
+    }, {});
+
+    const summaryBody = [];
+    const normalQty = (serviceSummary['normal']?.quantity || 0);
+    const casadaQty = serviceSummary['casada']?.quantity || 0;
+    const normalRev = (serviceSummary['normal']?.revenue || 0);
+    const casadaRev = serviceSummary['casada']?.revenue || 0;
+    
+    if (normalQty > 0 || casadaQty > 0) {
+      summaryBody.push([
+        'Normal / Casada', 
+        `${normalQty + casadaQty} Cargas (Normal: ${normalQty}, Casada: ${casadaQty})\nReceita: ${formatCurrency(normalRev + casadaRev)} (Normal: ${formatCurrency(normalRev)}, Casada: ${formatCurrency(casadaRev)})`
+      ]);
+    }
+    if (serviceSummary['cimento']) {
+      summaryBody.push(['Cimento', `${serviceSummary['cimento'].count} Cargas (${serviceSummary['cimento'].quantity} Sacas)\nReceita: ${formatCurrency(serviceSummary['cimento'].revenue)}`]);
+    }
+    if (serviceSummary['gas']) {
+      const gasDetails = Object.entries(serviceSummary['gas'].details)
+        .map(([size, qty]) => `${qty}x ${size}`)
+        .join(', ');
+      summaryBody.push(['Gás', `${serviceSummary['gas'].count} Cargas (${gasDetails})\nReceita: ${formatCurrency(serviceSummary['gas'].revenue)}`]);
+    }
+    if (serviceSummary['milho']) {
+      summaryBody.push(['Milho', `${serviceSummary['milho'].count} Cargas (${serviceSummary['milho'].quantity} Unidades)\nReceita: ${formatCurrency(serviceSummary['milho'].revenue)}`]);
+    }
+    if (serviceSummary['boa_vista']) {
+      summaryBody.push(['Boa Vista', `${serviceSummary['boa_vista'].count} Viagens\nReceita: ${formatCurrency(serviceSummary['boa_vista'].revenue)}`]);
+    }
+    if (serviceSummary['frete_avulso']) {
+      summaryBody.push(['Frete Avulso', `${serviceSummary['frete_avulso'].count} Serviços\nReceita: ${formatCurrency(serviceSummary['frete_avulso'].revenue)}`]);
+    }
+
+    if (summaryBody.length > 0) {
+      doc.setFontSize(14);
+      doc.text('Resumo de Serviços no Mês', 14, (doc as any).lastAutoTable.finalY + 15);
+
+      autoTable(doc, {
+        startY: (doc as any).lastAutoTable.finalY + 20,
+        head: [['Tipo de Serviço', 'Totalização']],
+        body: summaryBody,
+        theme: 'striped',
+        headStyles: { fillColor: [79, 70, 229] },
+      });
+    }
+
     doc.save(`Relatorio_${vehicle?.name.replace(/\s+/g, '_')}_${monthName.replace(/\s+/g, '_')}.pdf`);
+  };
+
+  const generateReceiptPDF = (record: MonthRecord) => {
+    const filteredServices = record.services.filter(s => s.type === 'normal' || s.type === 'casada');
+    if (filteredServices.length === 0) {
+      alert('Nenhum serviço Normal ou Casada encontrado para este período.');
+      return;
+    }
+
+    const doc = new jsPDF();
+    doc.setFont('helvetica', 'normal');
+    const vehicle = vehicles.find(v => v.id === record.vehicleId);
+    const monthName = format(new Date(record.year, record.month), 'MMMM yyyy', { locale: ptBR });
+    
+    const revenue = filteredServices.reduce((acc, s) => acc + getServiceRevenue(s), 0);
+    const normalServices = filteredServices.filter(s => s.type === 'normal');
+    const casadaServices = filteredServices.filter(s => s.type === 'casada');
+    const normalQty = normalServices.reduce((acc, s) => acc + s.quantity, 0);
+    const casadaQty = casadaServices.reduce((acc, s) => acc + s.quantity, 0);
+
+    // Company Header
+    if (settings.logoUrl) {
+      try {
+        doc.addImage(settings.logoUrl, 'JPEG', 14, 10, 30, 30);
+      } catch (e) {
+        console.error("Error adding logo to PDF", e);
+      }
+    }
+
+    doc.setFontSize(20);
+    doc.setTextColor(79, 70, 229); // Indigo 600
+    doc.setFont('helvetica', 'bold');
+    doc.text(settings.name, settings.logoUrl ? 50 : 14, 22);
+    
+    doc.setFontSize(10);
+    doc.setTextColor(100, 116, 139); // Slate 500
+    doc.setFont('helvetica', 'normal');
+    let headerY = 30;
+    if (settings.cnpj) {
+      doc.text(`CNPJ: ${settings.cnpj}`, settings.logoUrl ? 50 : 14, headerY);
+      headerY += 5;
+    }
+    if (settings.address) {
+      doc.text(settings.address, settings.logoUrl ? 50 : 14, headerY);
+      headerY += 5;
+    }
+    if (settings.phone || settings.email) {
+      doc.text(`${settings.phone || ''} ${settings.phone && settings.email ? '|' : ''} ${settings.email || ''}`, settings.logoUrl ? 50 : 14, headerY);
+      headerY += 5;
+    }
+
+    doc.setFontSize(9);
+    doc.setTextColor(148, 163, 184);
+    doc.text(`Recibo gerado em: ${format(new Date(), 'dd/MM/yyyy HH:mm')}`, 14, Math.max(headerY + 10, 45));
+
+    // Information Section Layout (Symmetric)
+    const infoStartY = Math.max(headerY + 20, 55);
+    
+    // Left side: Vehicle
+    doc.setFontSize(11);
+    doc.setTextColor(15, 23, 42);
+    doc.setFont('helvetica', 'bold');
+    doc.text('Dados do Veículo:', 14, infoStartY);
+    
+    doc.setFontSize(10);
+    doc.setFont('helvetica', 'normal');
+    doc.setTextColor(71, 85, 105);
+    doc.text(`Veículo: ${vehicle?.name || 'N/A'}`, 14, infoStartY + 7);
+    doc.text(`Placa: ${vehicle?.plate || 'N/A'}`, 14, infoStartY + 13);
+    doc.text(`Período: ${monthName}`, 14, infoStartY + 19);
+
+    let finalInfoY = infoStartY + 19;
+
+    // Right side: Client
+    if (record.client) {
+      doc.setFontSize(11);
+      doc.setTextColor(15, 23, 42);
+      doc.setFont('helvetica', 'bold');
+      doc.text('Dados do Cliente:', 110, infoStartY);
+      
+      doc.setFontSize(10);
+      doc.setFont('helvetica', 'normal');
+      doc.setTextColor(71, 85, 105);
+      let clientY = infoStartY + 7;
+      
+      // Wrap Empresa Name
+      const splitClientName = doc.splitTextToSize(`Empresa: ${record.client.name}`, 85);
+      doc.text(splitClientName, 110, clientY);
+      clientY += (splitClientName.length * 5);
+
+      if (record.client.cnpj) { doc.text(`CNPJ: ${record.client.cnpj}`, 110, clientY); clientY += 5; }
+      if (record.client.contactName) { doc.text(`Contato: ${record.client.contactName}`, 110, clientY); clientY += 5; }
+      if (record.client.phone) { doc.text(`Tel: ${record.client.phone}`, 110, clientY); clientY += 5; }
+      if (record.client.email) { doc.text(`E-mail: ${record.client.email}`, 110, clientY); clientY += 5; }
+      
+      if (record.client.address) { 
+        const splitAddress = doc.splitTextToSize(`End: ${record.client.address}`, 85);
+        doc.text(splitAddress, 110, clientY);
+        clientY += (splitAddress.length * 5);
+      }
+      finalInfoY = Math.max(finalInfoY, clientY);
+    }
+
+    let nextSectionY = finalInfoY + 15;
+
+    // Financial Summary
+    doc.setFontSize(13);
+    doc.setTextColor(79, 70, 229);
+    doc.setFont('helvetica', 'bold');
+    doc.text('Resumo Financeiro', 14, nextSectionY);
+
+    const summaryRows = [
+      ['Quantidade de Cargas Normal', `${normalQty} Cargas`],
+      ['Quantidade de Cargas Casada', `${casadaQty} Cargas`],
+      [{ content: 'VALOR TOTAL A RECEBER', styles: { fontStyle: 'bold' as const, fillColor: [248, 250, 252] as [number, number, number] } }, 
+       { content: formatCurrency(revenue), styles: { fontStyle: 'bold' as const, fillColor: [248, 250, 252] as [number, number, number], textColor: [79, 70, 229] as [number, number, number] } }],
+    ];
+
+    autoTable(doc, {
+      startY: nextSectionY + 5,
+      head: [['Descrição', 'Totalização']],
+      body: summaryRows,
+      theme: 'grid',
+      headStyles: { fillColor: [79, 70, 229], fontStyle: 'bold' },
+      styles: { font: 'helvetica', fontSize: 10 },
+      columnStyles: {
+        1: { halign: 'right' }
+      }
+    });
+
+    // Detailing
+    const detailStartY = (doc as any).lastAutoTable.finalY + 15;
+    doc.setFontSize(13);
+    doc.setTextColor(15, 23, 42);
+    doc.setFont('helvetica', 'bold');
+    doc.text('Detalhamento dos Serviços', 14, detailStartY);
+
+    autoTable(doc, {
+      startY: detailStartY + 5,
+      head: [['Data', 'Tipo', 'Motor.', 'Qtd', 'Valor Unit.', 'Total']],
+      body: filteredServices.map(s => [
+        format(parseISO(s.date), 'dd/MM/yyyy'),
+        (s.type === 'casada' ? 'Casada' : s.type === 'aleatorio' ? 'Aleatório' : 'Normal') + (s.observation ? `\nObs: ${s.observation}` : ''),
+        s.driverId || 1,
+        s.quantity + (s.overtimeHours ? ` (+${s.overtimeHours}h extra)` : ''),
+        formatCurrency((s.type === 'milho' || s.type === 'cimento' || s.type === 'gas' || s.type === 'frete_avulso' || s.type === 'aleatorio') ? (s.unitPrice || 0) : PRICES[s.type as keyof typeof PRICES]),
+        formatCurrency(s.quantity * ((s.type === 'milho' || s.type === 'cimento' || s.type === 'gas' || s.type === 'frete_avulso' || s.type === 'aleatorio') ? (s.unitPrice || 0) : PRICES[s.type as keyof typeof PRICES]))
+      ]),
+      theme: 'striped',
+      headStyles: { fillColor: [51, 65, 85], fontStyle: 'bold' },
+      styles: { font: 'helvetica', fontSize: 9 },
+      columnStyles: {
+        2: { halign: 'center' },
+        3: { halign: 'center' },
+        4: { halign: 'right' },
+        5: { halign: 'right' }
+      }
+    });
+
+    // Signature Area
+    const pageHeight = doc.internal.pageSize.height;
+    const signatureY = Math.max((doc as any).lastAutoTable.finalY + 40, pageHeight - 30);
+    
+    // Safety check if it overflows
+    if (signatureY > pageHeight - 10) {
+      doc.addPage();
+      doc.setDrawColor(200, 200, 200);
+      doc.line(60, 50, 150, 50);
+      doc.setFontSize(10);
+      doc.setTextColor(100, 116, 139);
+      doc.text('Assinatura do Recebedor', 105, 55, { align: 'center' });
+    } else {
+      doc.setDrawColor(200, 200, 200);
+      doc.line(60, signatureY, 150, signatureY);
+      doc.setFontSize(10);
+      doc.setTextColor(100, 116, 139);
+      doc.text('Assinatura do Recebedor', 105, signatureY + 5, { align: 'center' });
+    }
+
+    doc.save(`Recibo_${vehicle?.plate || 'Veiculo'}_${format(new Date(record.year, record.month), 'MM_yyyy')}.pdf`);
   };
 
   const generateFleetPDF = (month: number, year: number) => {
@@ -688,27 +1067,29 @@ export default function App() {
 
   if (!user) {
     return (
-      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4 font-sans">
-        <div className="bg-white w-full max-w-md rounded-3xl shadow-2xl p-8 text-center">
-          <div className="w-20 h-20 bg-indigo-600 rounded-2xl flex items-center justify-center text-white mx-auto mb-6 shadow-xl shadow-indigo-500/20 overflow-hidden">
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4 font-sans text-white">
+        <div className="bg-white w-full max-w-md rounded-3xl shadow-2xl p-8 text-center text-slate-900">
+          <div className="w-20 h-20 bg-indigo-600 rounded-2xl flex items-center justify-center text-white mx-auto mb-6 shadow-xl shadow-indigo-500/20">
             <Truck size={40} />
           </div>
-          <h1 className="text-2xl font-bold text-slate-900 mb-2">MicroServic</h1>
-          <p className="text-slate-500 mb-8">Faça login para acessar sua frota</p>
+          <h1 className="text-2xl font-bold mb-2">F.VIEIRA</h1>
+          <p className="text-slate-500 mb-8">Gestão de Frota</p>
           
           <button
             onClick={handleLogin}
-            className="w-full flex items-center justify-center gap-3 p-4 rounded-2xl bg-white border border-slate-200 hover:border-indigo-500 hover:bg-indigo-50 transition-all font-bold text-slate-700"
+            className="w-full flex items-center justify-center gap-3 p-4 rounded-2xl bg-indigo-600 hover:bg-indigo-700 transition-all font-bold text-white shadow-lg shadow-indigo-200"
           >
-            <LogIn size={20} className="text-indigo-600" />
-            Entrar com Google
+            <LogIn size={20} />
+            Entrar com Google para Começar
           </button>
+          
+          <p className="mt-6 text-[10px] text-slate-400 uppercase tracking-widest font-bold">Acesso Restrito</p>
         </div>
       </div>
     );
   }
 
-  if (!currentUserVehicleId) {
+  if (userRole === 'none') {
     return (
       <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4 font-sans">
         <div className="bg-white w-full max-w-md rounded-3xl shadow-2xl p-8 text-center">
@@ -720,64 +1101,39 @@ export default function App() {
             )}
           </div>
           <h1 className="text-2xl font-bold text-slate-900 mb-2">Bem-vindo ao {settings.name}</h1>
-          <p className="text-slate-500 mb-8">Identifique-se para acessar o sistema</p>
+          <p className="text-slate-500 mb-8">Digite a placa do veículo para acessar o painel de lançamento</p>
           
-          <div className="space-y-3">
-            {vehicles.map(v => (
-              <button
-                key={v.id}
-                onClick={() => {
-                  if (v.pin) {
-                    setPinToVerify(v.id);
-                  } else {
-                    setCurrentUserVehicleId(v.id);
-                  }
-                }}
-                className="w-full flex items-center gap-4 p-4 rounded-2xl border border-slate-100 hover:border-indigo-500 hover:bg-indigo-50 transition-all group text-left"
-              >
-                <div className="w-12 h-12 rounded-xl overflow-hidden bg-slate-100 shrink-0">
-                  {v.photoUrl ? (
-                    <img src={v.photoUrl} alt={v.name} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center text-slate-400">
-                      <Truck size={20} />
-                    </div>
-                  )}
-                </div>
-                <div className="flex-1">
-                  <p className="font-bold text-slate-900 group-hover:text-indigo-700">{v.name}</p>
-                  <p className="text-xs text-slate-500">{v.plate}</p>
-                </div>
-                <ChevronRight size={20} className="text-slate-300 group-hover:text-indigo-500" />
-              </button>
-            ))}
-          </div>
-
-          {isAdmin && (
-            <div className="mt-8 pt-6 border-t border-slate-100">
-              <button 
-                onClick={migrateData}
-                disabled={isMigrating}
-                className="w-full flex items-center justify-center gap-2 p-3 rounded-xl bg-slate-50 text-slate-600 hover:bg-indigo-50 hover:text-indigo-600 transition-all text-sm font-medium"
-              >
-                <Upload size={18} className={cn(isMigrating && "animate-bounce")} />
-                {isMigrating ? 'Migrando...' : 'Migrar dados do navegador para nuvem'}
-              </button>
-              <p className="text-[10px] text-slate-400 mt-2">Use isto se seus dados antigos não aparecerem na lista.</p>
+          <div className="space-y-4">
+            <div className="space-y-2 text-left">
+              <label className="text-xs font-bold text-slate-400 uppercase tracking-wider px-1">Placa do Veículo</label>
+              <input 
+                type="text" 
+                placeholder="ABC-1234"
+                value={plateInput}
+                onChange={(e) => setPlateInput(e.target.value.toUpperCase())}
+                className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-6 py-4 text-xl font-black text-slate-900 tracking-wider focus:ring-2 focus:ring-indigo-500 outline-none transition-all placeholder:text-slate-300"
+              />
+              {accessError && <p className="text-rose-500 text-xs font-bold px-1">{accessError}</p>}
             </div>
-          )}
-        </div>
 
-        {pinToVerify && (
-          <PinModal 
-            vehicle={vehicles.find(v => v.id === pinToVerify)!}
-            onClose={() => setPinToVerify(null)}
-            onSuccess={() => {
-              setCurrentUserVehicleId(pinToVerify);
-              setPinToVerify(null);
-            }}
-          />
-        )}
+            <button 
+              onClick={handlePlateAccess}
+              className="w-full bg-indigo-600 text-white font-bold py-4 rounded-2xl hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-200 flex items-center justify-center gap-2"
+            >
+              Acessar Painel de Lançamento
+              <ChevronRight size={20} />
+            </button>
+
+            <div className="pt-4 border-t border-slate-100">
+              <button 
+                onClick={handleLogout}
+                className="text-slate-400 text-xs font-bold hover:text-rose-500 transition-colors"
+              >
+                Sair da conta
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
     );
   }
@@ -810,7 +1166,7 @@ export default function App() {
             )}
           >
             <LayoutDashboard size={20} />
-            Dashboard
+            {isAdmin ? 'Dashboard Fleet' : 'Lançamentos'}
           </button>
           {isAdmin && (
             <>
@@ -878,7 +1234,7 @@ export default function App() {
             </div>
             <div className="flex-1 min-w-0">
               <p className="text-sm font-bold truncate">{currentUserVehicle?.name}</p>
-              <p className="text-[10px] text-slate-500 uppercase tracking-wider">{isAdmin ? 'Administrador' : 'Motorista'}</p>
+              <p className="text-[10px] text-slate-500 uppercase tracking-wider">{isAdmin ? 'Gestão de Cargas' : '🚛 Motorista'}</p>
             </div>
             <div className="flex items-center gap-1">
               {isAdmin && (
@@ -929,10 +1285,18 @@ export default function App() {
                     <button 
                       onClick={() => generateVehiclePDF(activeRecord)}
                       className="inline-flex items-center gap-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 px-4 py-2.5 rounded-xl font-medium transition-colors shadow-sm"
-                      title="Baixar PDF do Veículo"
+                      title="Baixar PDF Completo do Veículo"
                     >
                       <FileDown size={18} />
                       PDF
+                    </button>
+                    <button 
+                      onClick={() => generateReceiptPDF(activeRecord)}
+                      className="inline-flex items-center gap-2 bg-indigo-50 border border-indigo-100 hover:bg-indigo-100 text-indigo-700 px-4 py-2.5 rounded-xl font-medium transition-colors shadow-sm"
+                      title="Baixar Recibo (Normal/Casada)"
+                    >
+                      <FileDown size={18} />
+                      Recibo
                     </button>
                     <button 
                       onClick={() => generateFleetPDF(activeRecord.month, activeRecord.year)}
@@ -976,6 +1340,7 @@ export default function App() {
                   vehicles={vehicles}
                   selectedVehicleId={selectedVehicleId}
                   onAdd={handleQuickAddService} 
+                  isDriver={isDriver}
                 />
                 {/* Stats Grid */}
                 {isAdmin && (
@@ -1012,7 +1377,10 @@ export default function App() {
                 )}
 
                 {isAdmin && (
-                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                  (() => {
+                    const stats = calculateCosts(activeRecord);
+                    return (
+                      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
                     {/* Revenue Chart */}
                     <div className="lg:col-span-2 bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
                       <h3 className="text-lg font-bold mb-6 flex items-center gap-2">
@@ -1058,12 +1426,14 @@ export default function App() {
                           <PieChart>
                             <Pie
                               data={[
-                                { name: 'Diesel', value: calculateCosts(activeRecord).diesel },
-                                { name: 'Motorista', value: calculateCosts(activeRecord).driverBase + activeRecord.services.reduce((acc, s) => acc + (s.driverPayment || 0), 0) },
-                                { name: 'Horas Extras', value: calculateCosts(activeRecord).overtime },
-                                { name: 'Manutenção', value: calculateCosts(activeRecord).maintenance },
-                                { name: 'Impostos', value: calculateCosts(activeRecord).taxes },
-                                { name: 'Extras', value: calculateCosts(activeRecord).extraCosts },
+                                { name: 'Diesel', value: stats.diesel },
+                                ...(stats.driver1Days > 0 ? [{ name: 'Mot. 1', value: stats.driver1TotalCost }] : []),
+                                ...(stats.driver2Days > 0 ? [{ name: 'Mot. 2', value: stats.driver2TotalCost }] : []),
+                                ...(stats.driver1Days === 0 && stats.driver2Days === 0 ? [{ name: 'Motorista', value: stats.driverBase }] : []),
+                                { name: 'Horas Extras', value: stats.overtime },
+                                { name: 'Manutenção', value: stats.maintenance },
+                                { name: 'Impostos', value: stats.taxes },
+                                { name: 'Extras', value: stats.extraCosts },
                               ]}
                               cx="50%"
                               cy="50%"
@@ -1088,20 +1458,32 @@ export default function App() {
                         </ResponsiveContainer>
                       </div>
                         <div className="mt-4 space-y-3">
-                          <CostItem label="Diesel" value={calculateCosts(activeRecord).diesel} color="bg-indigo-600" />
-                          <CostItem label="Motorista (Diárias/Viagens)" value={calculateCosts(activeRecord).driverBase + activeRecord.services.reduce((acc, s) => acc + (s.driverPayment || 0), 0)} color="bg-cyan-500" />
-                          {calculateCosts(activeRecord).overtime > 0 && (
-                            <CostItem label="Horas Extras" value={calculateCosts(activeRecord).overtime} color="bg-sky-400" />
+                          <CostItem label="Diesel" value={stats.diesel} color="bg-indigo-600" />
+                          
+                          {stats.driver1Days > 0 && (
+                            <CostItem label="Motorista 1" value={stats.driver1TotalCost} color="bg-cyan-500" />
                           )}
-                          <CostItem label="Manutenção" value={calculateCosts(activeRecord).maintenance} color="bg-amber-500" />
-                          <CostItem label="Impostos (Exceto Milho)" value={calculateCosts(activeRecord).taxes} color="bg-rose-500" />
-                          {calculateCosts(activeRecord).extraCosts > 0 && (
-                            <CostItem label="Custos Extras (Ajudante/Almoço/Porto)" value={calculateCosts(activeRecord).extraCosts} color="bg-violet-500" />
+                          {stats.driver2Days > 0 && (
+                            <CostItem label="Motorista 2" value={stats.driver2TotalCost} color="bg-cyan-600" />
+                          )}
+                          {stats.driver1Days === 0 && stats.driver2Days === 0 && (
+                            <CostItem label="Motorista (Diárias)" value={stats.driverBase} color="bg-cyan-500" />
+                          )}
+
+                          {stats.overtime > 0 && (
+                            <CostItem label="Horas Extras" value={stats.overtime} color="bg-sky-400" />
+                          )}
+                          <CostItem label="Manutenção" value={stats.maintenance} color="bg-amber-500" />
+                          <CostItem label="Impostos (Exceto Milho)" value={stats.taxes} color="bg-rose-500" />
+                          {stats.extraCosts > 0 && (
+                            <CostItem label="Custos Extras (Comis / Ajudante / Almoço)" value={stats.extraCosts} color="bg-violet-500" />
                           )}
                         </div>
                     </div>
                   </div>
-                )}
+                );
+              })()
+            )}
 
                 {/* Recent Services Table */}
                 <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
@@ -1132,22 +1514,24 @@ export default function App() {
                               <span className={cn(
                                 "px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wide whitespace-nowrap",
                                 s.type === 'casada' ? "bg-indigo-100 text-indigo-700" : 
-                                s.type === 'normal' || s.type === 'armazem' ? "bg-cyan-100 text-cyan-700" : 
+                                s.type === 'normal' ? "bg-cyan-100 text-cyan-700" : 
                                 s.type === 'milho' ? "bg-amber-100 text-amber-700" : 
                                 s.type === 'boa_vista' ? "bg-emerald-100 text-emerald-700" : 
                                 s.type === 'gas' ? "bg-orange-100 text-orange-700" : 
+                                s.type === 'aleatorio' ? "bg-pink-100 text-pink-700" :
                                 s.type === 'frete_avulso' ? "bg-purple-100 text-purple-700" : "bg-slate-100 text-slate-700"
                               )}>
                                 {s.type === 'casada' ? 'Casada' : 
-                                 s.type === 'normal' || s.type === 'armazem' ? 'Normal' : 
+                                 s.type === 'normal' ? 'Normal' : 
                                  s.type === 'milho' ? 'Milho' : 
                                  s.type === 'boa_vista' ? 'Boa Vista' : 
                                  s.type === 'gas' ? 'Gás' : 
-                                 s.type === 'frete_avulso' ? 'Frete Avulso' : 'Cimento'}
+                                 s.type === 'frete_avulso' ? 'Frete Avulso' : 
+                                 s.type === 'aleatorio' ? 'Aleatório' : 'Cimento'}
                               </span>
                             </td>
                             <td className="px-6 py-4 text-sm text-slate-600 whitespace-nowrap">
-                              {s.quantity} {(s.type === 'milho' || s.type === 'cimento') ? 'sacas' : 'unid.'}
+                              {s.quantity} {(s.type === 'milho' || s.type === 'cimento' || s.type === 'aleatorio') ? 'cargas/sacas' : 'unid.'}
                               {s.containerSize && (
                                 <span className="text-[10px] text-orange-600 block font-bold">
                                   Tam: {s.containerSize}
@@ -1162,7 +1546,7 @@ export default function App() {
                                   ))}
                                 </div>
                               )}
-                              {s.driverPayment && (
+                              {isAdmin && s.driverPayment && (
                                 <span className="text-[10px] text-indigo-500 block font-bold">
                                   Pagto: {formatCurrency(s.driverPayment)}
                                 </span>
@@ -1172,6 +1556,11 @@ export default function App() {
                                   H. Extra: {s.overtimeHours}h
                                 </span>
                               ) : null}
+                              {s.observation && (
+                                <span className="text-[10px] text-slate-400 block italic mt-1 bg-slate-50 p-1 rounded border border-slate-100">
+                                  Obs: {s.observation}
+                                </span>
+                              )}
                             </td>
                             {isAdmin && (
                               <td className="px-6 py-4 text-sm font-bold whitespace-nowrap text-slate-900">
@@ -1184,12 +1573,14 @@ export default function App() {
                               </td>
                             )}
                             <td className="px-6 py-4 text-right">
-                              <button 
-                                onClick={() => handleDeleteService(activeRecord.id, s.id)}
-                                className="p-1.5 text-slate-300 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-all opacity-0 group-hover:opacity-100"
-                              >
-                                <Trash2 size={16} />
-                              </button>
+                              {isAdmin && (
+                                <button 
+                                  onClick={() => handleDeleteService(activeRecord.id, s.id)}
+                                  className="p-1.5 text-slate-300 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-all opacity-0 group-hover:opacity-100"
+                                >
+                                  <Trash2 size={16} />
+                                </button>
+                              )}
                             </td>
                           </tr>
                         ))}
@@ -1672,16 +2063,17 @@ function GasItemsModal({ items, onSave, onClose }: {
   );
 }
 
-function QuickAddService({ vehicles, selectedVehicleId, onAdd }: { 
+function QuickAddService({ vehicles, selectedVehicleId, onAdd, isDriver }: { 
   vehicles: Vehicle[];
   selectedVehicleId: string;
-  onAdd: (s: Omit<ServiceEntry, 'id'>) => void 
+  onAdd: (s: Omit<ServiceEntry, 'id'>) => void;
+  isDriver?: boolean;
 }) {
   const [date, setDate] = useState(format(new Date(), 'yyyy-MM-dd'));
   const [type, setType] = useState<ServiceType>('normal');
   const [qty, setQty] = useState<string>('1');
   const [unitPrice, setUnitPrice] = useState<string>('0');
-  const [driverPayment, setDriverPayment] = useState<string>('1000');
+  const [driverPayment, setDriverPayment] = useState<string>('0');
   const [containerSize, setContainerSize] = useState<string>('13kg');
   const [gasItems, setGasItems] = useState<GasItem[]>([]);
   const [showGasModal, setShowGasModal] = useState(false);
@@ -1690,6 +2082,9 @@ function QuickAddService({ vehicles, selectedVehicleId, onAdd }: {
   const [portCost, setPortCost] = useState<string>('0');
   const [dieselBuckets, setDieselBuckets] = useState<string>('0');
   const [overtimeHours, setOvertimeHours] = useState<string>('0');
+  const [driverId, setDriverId] = useState<1 | 2>(1);
+  const [agentCommission, setAgentCommission] = useState<string>('0');
+  const [observation, setObservation] = useState<string>('');
 
   const handleAdd = () => {
     const totalQty = type === 'gas' && gasItems.length > 0 
@@ -1697,101 +2092,150 @@ function QuickAddService({ vehicles, selectedVehicleId, onAdd }: {
       : parseFloat(qty) || 0;
 
     const isAtego = vehicles.find(v => v.id === selectedVehicleId)?.name.includes('Atego 2425');
+    const isConstellation = vehicles.find(v => v.id === selectedVehicleId)?.name.includes('Constellation 30280');
 
     onAdd({ 
       date, 
       type, 
       quantity: totalQty, 
-      unitPrice: (type === 'milho' || type === 'cimento' || type === 'frete_avulso' || (type === 'gas' && gasItems.length === 0)) ? (parseFloat(unitPrice) || 0) : undefined,
-      driverPayment: (type === 'boa_vista' || type === 'gas') ? (parseFloat(driverPayment) || 0) : undefined,
+      unitPrice: (type === 'milho' || type === 'cimento' || type === 'frete_avulso' || type === 'aleatorio' || (type === 'gas' && gasItems.length === 0)) ? (parseFloat(unitPrice) || 0) : undefined,
+      driverPayment: (type === 'boa_vista' || type === 'gas' || isConstellation) ? (parseFloat(driverPayment) || 0) : undefined,
       containerSize: (type === 'gas' && gasItems.length === 0) ? containerSize : undefined,
       gasItems: type === 'gas' && gasItems.length > 0 ? gasItems : undefined,
       helperCost: isAtego ? (parseFloat(helperCost) || 0) : 0,
       lunchCost: isAtego ? (parseFloat(lunchCost) || 0) : 0,
       portCost: isAtego ? (parseFloat(portCost) || 0) : 0,
       dieselLiters: (parseFloat(dieselBuckets) || 0) * 20,
-      overtimeHours: parseFloat(overtimeHours) || 0
+      overtimeHours: parseFloat(overtimeHours) || 0,
+      driverId,
+      agentCommission: type === 'milho' ? (parseFloat(agentCommission) || 0) : undefined,
+      observation: observation.trim() || undefined
     });
     setGasItems([]);
     setDieselBuckets('0');
     setOvertimeHours('0');
+    setAgentCommission('0');
+    setDriverPayment('0');
+    setObservation('');
   };
 
   return (
-    <div className="bg-indigo-900 text-white p-4 rounded-2xl shadow-lg flex flex-col md:flex-row items-center gap-4">
-      <div className="flex items-center gap-3 shrink-0">
-        <div className="w-10 h-10 bg-white/10 rounded-xl flex items-center justify-center">
-          <Plus size={20} />
+    <div className="bg-indigo-900 text-white p-4 rounded-2xl shadow-lg flex flex-col items-center gap-4">
+      <div className="flex flex-col md:flex-row items-center gap-4 w-full">
+        <div className="flex items-center gap-3 shrink-0">
+          <div className="w-10 h-10 bg-white/10 rounded-xl flex items-center justify-center">
+            <Plus size={20} />
+          </div>
+          <div>
+            <p className="text-xs font-bold text-indigo-200 uppercase tracking-wider">Lançamento Rápido</p>
+            <p className="text-sm font-medium">Adicionar carga hoje</p>
+          </div>
         </div>
-        <div>
-          <p className="text-xs font-bold text-indigo-200 uppercase tracking-wider">Lançamento Rápido</p>
-          <p className="text-sm font-medium">Adicionar carga hoje</p>
+        
+        <div className="flex-1 grid grid-cols-1 sm:grid-cols-4 lg:grid-cols-5 gap-3 w-full">
+          <input 
+            type="date" 
+            value={date}
+            onChange={(e) => setDate(e.target.value)}
+            className="bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all"
+          />
+          <select 
+            value={type}
+            onChange={(e) => setType(e.target.value as ServiceType)}
+            className="bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all"
+          >
+            <option value="casada" className="text-slate-900">Casada</option>
+            <option value="normal" className="text-slate-900">Normal</option>
+            <option value="milho" className="text-slate-900">Milho</option>
+            <option value="cimento" className="text-slate-900">Cimento</option>
+            <option value="boa_vista" className="text-slate-900">Boa Vista</option>
+            <option value="gas" className="text-slate-900">Gás</option>
+            <option value="frete_avulso" className="text-slate-900">Frete Avulso</option>
+            <option value="aleatorio" className="text-slate-900">Aleatório</option>
+          </select>
+          {type === 'gas' && (
+            <div className="flex gap-2">
+              <select 
+                value={containerSize}
+                onChange={(e) => setContainerSize(e.target.value)}
+                className="bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all"
+              >
+                <option value="20kg" className="text-slate-900">20kg</option>
+                <option value="13kg" className="text-slate-900">13kg</option>
+                <option value="10kg" className="text-slate-900">10kg</option>
+                <option value="8kg" className="text-slate-900">8kg</option>
+                <option value="5kg" className="text-slate-900">5kg</option>
+              </select>
+              <button 
+                onClick={() => setShowGasModal(true)}
+                className={cn(
+                  "px-4 py-2 rounded-xl text-xs font-bold uppercase transition-all whitespace-nowrap",
+                  gasItems.length > 0 ? "bg-emerald-500 text-white" : "bg-white/10 text-indigo-200 hover:bg-white/20"
+                )}
+              >
+                {gasItems.length > 0 ? `${gasItems.length} Tamanhos` : 'Vários Tamanhos'}
+              </button>
+            </div>
+          )}
+          <div className="flex gap-2">
+            <input 
+              type="number" 
+              placeholder={(type === 'milho' || type === 'cimento' || type === 'gas' || type === 'frete_avulso' || type === 'aleatorio') ? "Sacas/Qtd" : "Qtd"}
+              value={type === 'gas' && gasItems.length > 0 ? gasItems.reduce((acc, i) => acc + i.quantity, 0).toString() : qty}
+              disabled={type === 'gas' && gasItems.length > 0}
+              onChange={(e) => setQty(e.target.value)}
+              className="flex-1 bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all disabled:opacity-50"
+            />
+            {(!isDriver && (type === 'milho' || type === 'cimento' || type === 'frete_avulso' || type === 'aleatorio' || (type === 'gas' && gasItems.length === 0))) && (
+              <input 
+                type="number" 
+                placeholder="R$ / Unid"
+                value={unitPrice}
+                onChange={(e) => setUnitPrice(e.target.value)}
+                className="flex-1 bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all"
+              />
+            )}
+          </div>
+          <div className="flex flex-col">
+            <label className="text-[10px] text-indigo-200 font-bold uppercase mb-1">Motorista</label>
+            <div className="flex bg-white/10 border border-white/20 rounded-xl p-0.5">
+              <button
+                onClick={() => setDriverId(1)}
+                className={cn(
+                  "flex-1 py-1 text-[10px] font-bold uppercase rounded-lg transition-all",
+                  driverId === 1 ? "bg-white text-indigo-900 shadow-sm" : "text-indigo-200 hover:bg-white/10"
+                )}
+              >
+                Mot 1
+              </button>
+              <button
+                onClick={() => setDriverId(2)}
+                className={cn(
+                  "flex-1 py-1 text-[10px] font-bold uppercase rounded-lg transition-all",
+                  driverId === 2 ? "bg-white text-indigo-900 shadow-sm" : "text-indigo-200 hover:bg-white/10"
+                )}
+              >
+                Mot 2
+              </button>
+            </div>
+          </div>
+
+          {vehicles.find(v => v.id === selectedVehicleId)?.name.includes('Constellation 30280') && (
+            <div className="flex flex-col flex-1">
+              <label className="text-[10px] text-indigo-200 font-bold uppercase mb-1">Pagamento Mot.</label>
+              <input 
+                type="number" 
+                placeholder="R$ Diária"
+                value={driverPayment}
+                onChange={(e) => setDriverPayment(e.target.value)}
+                className="bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all text-white placeholder:text-white/30 w-24"
+              />
+            </div>
+          )}
         </div>
       </div>
       
-      <div className="flex-1 grid grid-cols-1 sm:grid-cols-4 lg:grid-cols-5 gap-3 w-full">
-        <input 
-          type="date" 
-          value={date}
-          onChange={(e) => setDate(e.target.value)}
-          className="bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all"
-        />
-        <select 
-          value={type}
-          onChange={(e) => setType(e.target.value as ServiceType)}
-          className="bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all"
-        >
-          <option value="casada" className="text-slate-900">Casada</option>
-          <option value="normal" className="text-slate-900">Normal</option>
-          <option value="milho" className="text-slate-900">Milho</option>
-          <option value="cimento" className="text-slate-900">Cimento</option>
-          <option value="boa_vista" className="text-slate-900">Boa Vista</option>
-          <option value="gas" className="text-slate-900">Gás</option>
-          <option value="frete_avulso" className="text-slate-900">Frete Avulso</option>
-        </select>
-        {type === 'gas' && (
-          <div className="flex gap-2">
-            <select 
-              value={containerSize}
-              onChange={(e) => setContainerSize(e.target.value)}
-              className="bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all"
-            >
-              <option value="20kg" className="text-slate-900">20kg</option>
-              <option value="13kg" className="text-slate-900">13kg</option>
-              <option value="10kg" className="text-slate-900">10kg</option>
-              <option value="8kg" className="text-slate-900">8kg</option>
-              <option value="5kg" className="text-slate-900">5kg</option>
-            </select>
-            <button 
-              onClick={() => setShowGasModal(true)}
-              className={cn(
-                "px-4 py-2 rounded-xl text-xs font-bold uppercase transition-all whitespace-nowrap",
-                gasItems.length > 0 ? "bg-emerald-500 text-white" : "bg-white/10 text-indigo-200 hover:bg-white/20"
-              )}
-            >
-              {gasItems.length > 0 ? `${gasItems.length} Tamanhos` : 'Vários Tamanhos'}
-            </button>
-          </div>
-        )}
-        <div className="flex gap-2">
-          <input 
-            type="number" 
-            placeholder={(type === 'milho' || type === 'cimento' || type === 'gas' || type === 'frete_avulso') ? "Sacas/Qtd" : "Qtd"}
-            value={type === 'gas' && gasItems.length > 0 ? gasItems.reduce((acc, i) => acc + i.quantity, 0).toString() : qty}
-            disabled={type === 'gas' && gasItems.length > 0}
-            onChange={(e) => setQty(e.target.value)}
-            className="flex-1 bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all disabled:opacity-50"
-          />
-          {(type === 'milho' || type === 'cimento' || type === 'frete_avulso' || (type === 'gas' && gasItems.length === 0)) && (
-            <input 
-              type="number" 
-              placeholder="R$ / Unid"
-              value={unitPrice}
-              onChange={(e) => setUnitPrice(e.target.value)}
-              className="flex-1 bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all"
-            />
-          )}
-        </div>
+      <div className="grid grid-cols-1 sm:grid-cols-5 gap-3 w-full border-t border-white/10 pt-3">
         {(type === 'boa_vista' || type === 'gas') && (
           <div className="flex flex-col">
             <label className="text-[10px] text-indigo-200 font-bold uppercase mb-1">Pagto Motorista</label>
@@ -1800,6 +2244,18 @@ function QuickAddService({ vehicles, selectedVehicleId, onAdd }: {
               placeholder="Pagto Motorista"
               value={driverPayment}
               onChange={(e) => setDriverPayment(e.target.value)}
+              className="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all"
+            />
+          </div>
+        )}
+        {(!isDriver && type === 'milho') && (
+          <div className="flex flex-col">
+            <label className="text-[10px] text-indigo-200 font-bold uppercase mb-1">Comissão Agenc. (R$)</label>
+            <input 
+              type="number" 
+              placeholder="R$"
+              value={agentCommission}
+              onChange={(e) => setAgentCommission(e.target.value)}
               className="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all"
             />
           </div>
@@ -1824,12 +2280,24 @@ function QuickAddService({ vehicles, selectedVehicleId, onAdd }: {
             className="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all"
           />
         </div>
-        <button 
-          onClick={handleAdd}
-          className="bg-white text-indigo-900 font-bold text-sm rounded-xl px-4 py-2 hover:bg-indigo-50 transition-colors"
-        >
-          Lançar
-        </button>
+        <div className="flex flex-col sm:col-span-1 md:col-span-2">
+          <label className="text-[10px] text-indigo-200 font-bold uppercase mb-1">Observação</label>
+          <input 
+            type="text" 
+            placeholder="Nota opcional..."
+            value={observation}
+            onChange={(e) => setObservation(e.target.value)}
+            className="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all font-medium placeholder:text-white/30"
+          />
+        </div>
+        <div className="flex items-end">
+          <button 
+            onClick={handleAdd}
+            className="w-full bg-white text-indigo-900 font-bold text-sm h-[38px] rounded-xl hover:bg-indigo-50 transition-colors"
+          >
+            Lançar
+          </button>
+        </div>
       </div>
 
       {/* Extra costs for Atego 2425 */}
@@ -1900,6 +2368,14 @@ function RecordModal({ vehicleId, vehicles, record, onClose, onSubmit }: {
   const [overtimeHours, setOvertimeHours] = useState(record?.costs.overtimeHours ?? 0);
   const [overtimeRate, setOvertimeRate] = useState(record?.costs.overtimeRate ?? 0);
 
+  // Client Info
+  const [clientName, setClientName] = useState(record?.client?.name ?? '');
+  const [clientCnpj, setClientCnpj] = useState(record?.client?.cnpj ?? '');
+  const [clientContact, setClientContact] = useState(record?.client?.contactName ?? '');
+  const [clientPhone, setClientPhone] = useState(record?.client?.phone ?? '');
+  const [clientAddress, setClientAddress] = useState(record?.client?.address ?? '');
+  const [clientEmail, setClientEmail] = useState(record?.client?.email ?? '');
+
   const fillDefaultData = () => {
     setDieselLiters(550);
     setDieselPrice(DEFAULT_DIESEL_PRICE);
@@ -1916,7 +2392,7 @@ function RecordModal({ vehicleId, vehicles, record, onClose, onSubmit }: {
   const [newServiceType, setNewServiceType] = useState<ServiceType>('normal');
   const [newServiceQty, setNewServiceQty] = useState<string>('1');
   const [newServiceUnitPrice, setNewServiceUnitPrice] = useState<string>('0');
-  const [newServiceDriverPayment, setNewServiceDriverPayment] = useState<string>('1000');
+  const [newServiceDriverPayment, setNewServiceDriverPayment] = useState<string>('0');
   const [newServiceContainerSize, setNewServiceContainerSize] = useState<string>('13kg');
   const [newServiceGasItems, setNewServiceGasItems] = useState<GasItem[]>([]);
   const [showNewServiceGasModal, setShowNewServiceGasModal] = useState(false);
@@ -1925,16 +2401,20 @@ function RecordModal({ vehicleId, vehicles, record, onClose, onSubmit }: {
   const [newServicePortCost, setNewServicePortCost] = useState<string>('0');
   const [newServiceDieselBuckets, setNewServiceDieselBuckets] = useState<string>('0');
   const [newServiceOvertimeHours, setNewServiceOvertimeHours] = useState<string>('0');
+  const [newServiceDriverId, setNewServiceDriverId] = useState<1 | 2>(1);
+  const [newServiceAgentCommission, setNewServiceAgentCommission] = useState<string>('0');
 
   const addService = () => {
     const totalQty = newServiceType === 'gas' && newServiceGasItems.length > 0
       ? newServiceGasItems.reduce((acc, i) => acc + i.quantity, 0)
       : parseFloat(newServiceQty) || 0;
 
-    const isAtego = vehicles.find(v => v.id === record?.vehicleId)?.name.includes('Atego 2425');
+    const isAtego = vehicles.find(v => v.id === record?.vehicleId || v.id === vehicleId)?.name.includes('Atego 2425');
 
     const addedDiesel = (parseFloat(newServiceDieselBuckets) || 0) * 20;
     const addedOvertime = parseFloat(newServiceOvertimeHours) || 0;
+
+    const isConstellation = vehicles.find(v => v.id === record?.vehicleId)?.name.includes('Constellation 30280');
 
     const newService: ServiceEntry = {
       id: crypto.randomUUID(),
@@ -1942,14 +2422,16 @@ function RecordModal({ vehicleId, vehicles, record, onClose, onSubmit }: {
       type: newServiceType,
       quantity: totalQty,
       unitPrice: (newServiceType === 'milho' || newServiceType === 'cimento' || newServiceType === 'frete_avulso' || (newServiceType === 'gas' && newServiceGasItems.length === 0)) ? (parseFloat(newServiceUnitPrice) || 0) : undefined,
-      driverPayment: (newServiceType === 'boa_vista' || newServiceType === 'gas') ? (parseFloat(newServiceDriverPayment) || 0) : undefined,
+      driverPayment: (newServiceType === 'boa_vista' || newServiceType === 'gas' || isConstellation) ? (parseFloat(newServiceDriverPayment) || 0) : undefined,
       containerSize: (newServiceType === 'gas' && newServiceGasItems.length === 0) ? newServiceContainerSize : undefined,
       gasItems: newServiceType === 'gas' && newServiceGasItems.length > 0 ? newServiceGasItems : undefined,
       helperCost: isAtego ? (parseFloat(newServiceHelperCost) || 0) : 0,
       lunchCost: isAtego ? (parseFloat(newServiceLunchCost) || 0) : 0,
       portCost: isAtego ? (parseFloat(newServicePortCost) || 0) : 0,
       dieselLiters: addedDiesel,
-      overtimeHours: addedOvertime
+      overtimeHours: addedOvertime,
+      driverId: newServiceDriverId,
+      agentCommission: newServiceType === 'milho' ? (parseFloat(newServiceAgentCommission) || 0) : undefined
     };
     const updatedServices = [...services, newService].sort((a, b) => a.date.localeCompare(b.date));
     setServices(updatedServices);
@@ -1958,6 +2440,8 @@ function RecordModal({ vehicleId, vehicles, record, onClose, onSubmit }: {
     setNewServiceGasItems([]);
     setNewServiceDieselBuckets('0');
     setNewServiceOvertimeHours('0');
+    setNewServiceAgentCommission('0');
+    setNewServiceDriverPayment('0');
     
     // Auto-calculate driver days based on unique dates (excluding per-trip services)
     const nonTripDates = new Set(updatedServices.filter(s => s.type !== 'boa_vista' && s.type !== 'gas').map(s => s.date));
@@ -1998,7 +2482,15 @@ function RecordModal({ vehicleId, vehicles, record, onClose, onSubmit }: {
         maintenanceLabor,
         overtimeHours,
         overtimeRate
-      }
+      },
+      client: clientName ? {
+        name: clientName,
+        cnpj: clientCnpj,
+        contactName: clientContact,
+        phone: clientPhone,
+        address: clientAddress,
+        email: clientEmail
+      } : undefined
     });
   };
 
@@ -2048,6 +2540,76 @@ function RecordModal({ vehicleId, vehicles, record, onClose, onSubmit }: {
                   onChange={(e) => setYear(parseInt(e.target.value))}
                   className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 focus:ring-2 focus:ring-indigo-500 outline-none"
                 />
+              </div>
+            </div>
+            
+            {/* Client Info Section */}
+            <div className="space-y-4">
+              <h3 className="text-lg font-bold flex items-center gap-2">
+                <Building2 size={20} className="text-indigo-600" />
+                Dados do Cliente (Opcional)
+              </h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-500 uppercase">Nome da Empresa</label>
+                  <input 
+                    type="text" 
+                    value={clientName} 
+                    onChange={(e) => setClientName(e.target.value)}
+                    placeholder="Ex: Transportadora XYZ"
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2 focus:ring-2 focus:ring-indigo-500 outline-none"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-500 uppercase">CNPJ</label>
+                  <input 
+                    type="text" 
+                    value={clientCnpj} 
+                    onChange={(e) => setClientCnpj(e.target.value)}
+                    placeholder="00.000.000/0000-00"
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2 focus:ring-2 focus:ring-indigo-500 outline-none"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-500 uppercase">Nome do Contato</label>
+                  <input 
+                    type="text" 
+                    value={clientContact} 
+                    onChange={(e) => setClientContact(e.target.value)}
+                    placeholder="Nome do responsável"
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2 focus:ring-2 focus:ring-indigo-500 outline-none"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-500 uppercase">Telefone</label>
+                  <input 
+                    type="text" 
+                    value={clientPhone} 
+                    onChange={(e) => setClientPhone(e.target.value)}
+                    placeholder="(00) 00000-0000"
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2 focus:ring-2 focus:ring-indigo-500 outline-none"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-500 uppercase">E-mail</label>
+                  <input 
+                    type="email" 
+                    value={clientEmail} 
+                    onChange={(e) => setClientEmail(e.target.value)}
+                    placeholder="cliente@email.com"
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2 focus:ring-2 focus:ring-indigo-500 outline-none"
+                  />
+                </div>
+                <div className="space-y-1.5 lg:col-span-2">
+                  <label className="text-xs font-bold text-slate-500 uppercase">Endereço</label>
+                  <input 
+                    type="text" 
+                    value={clientAddress} 
+                    onChange={(e) => setClientAddress(e.target.value)}
+                    placeholder="Rua, Número, Bairro, Cidade"
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2 focus:ring-2 focus:ring-indigo-500 outline-none"
+                  />
+                </div>
               </div>
             </div>
 
@@ -2103,6 +2665,43 @@ function RecordModal({ vehicleId, vehicles, record, onClose, onSubmit }: {
                       <option value="frete_avulso">Frete Avulso (Manual)</option>
                     </select>
                 </div>
+                <div className="w-24 space-y-2">
+                  <label className="text-xs font-bold text-slate-500 uppercase">Motorista</label>
+                  <div className="flex bg-slate-100 border border-slate-200 rounded-xl p-0.5">
+                    <button
+                      type="button"
+                      onClick={() => setNewServiceDriverId(1)}
+                      className={cn(
+                        "flex-1 py-1 text-[10px] font-bold uppercase rounded-lg transition-all",
+                        newServiceDriverId === 1 ? "bg-white text-indigo-900 shadow-sm" : "text-slate-500 hover:bg-slate-200"
+                      )}
+                    >
+                      1
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setNewServiceDriverId(2)}
+                      className={cn(
+                        "flex-1 py-1 text-[10px] font-bold uppercase rounded-lg transition-all",
+                        newServiceDriverId === 2 ? "bg-white text-indigo-900 shadow-sm" : "text-slate-500 hover:bg-slate-200"
+                      )}
+                    >
+                      2
+                    </button>
+                  </div>
+                </div>
+                {newServiceType === 'milho' && (
+                  <div className="flex-1 space-y-2">
+                    <label className="text-xs font-bold text-slate-500 uppercase">Comissão Agenc.</label>
+                    <input 
+                      type="number" 
+                      value={newServiceAgentCommission} 
+                      onChange={(e) => setNewServiceAgentCommission(e.target.value)}
+                      placeholder="R$"
+                      className="w-full bg-white border border-slate-200 rounded-xl px-4 py-2 focus:ring-2 focus:ring-indigo-500 outline-none text-slate-900"
+                    />
+                  </div>
+                )}
                 {newServiceType === 'gas' && (
                   <div className="flex-1 space-y-2">
                     <label className="text-xs font-bold text-slate-500 uppercase">Vasilhame</label>
@@ -2131,7 +2730,7 @@ function RecordModal({ vehicleId, vehicles, record, onClose, onSubmit }: {
                     </div>
                   </div>
                 )}
-                {(newServiceType === 'boa_vista' || newServiceType === 'gas') && (
+                {(newServiceType === 'boa_vista' || newServiceType === 'gas' || vehicles.find(v => v.id === record?.vehicleId)?.name.includes('Constellation 30280')) && (
                   <div className="flex-1 space-y-2">
                     <label className="text-xs font-bold text-slate-500 uppercase">Pagto Motorista</label>
                     <input 

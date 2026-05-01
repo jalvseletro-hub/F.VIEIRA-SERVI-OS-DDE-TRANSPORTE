@@ -1,4 +1,4 @@
-export type ServiceType = 'casada' | 'normal' | 'milho' | 'cimento' | 'armazem' | 'boa_vista' | 'gas' | 'frete_avulso';
+export type ServiceType = 'casada' | 'normal' | 'milho' | 'cimento' | 'boa_vista' | 'gas' | 'frete_avulso' | 'aleatorio';
 
 export interface GasItem {
   id: string;
@@ -21,6 +21,9 @@ export interface ServiceEntry {
   portCost?: number;   // Specific for Atego 2425
   dieselLiters?: number; // Added for quick diesel entry
   overtimeHours?: number; // Added for quick overtime entry
+  driverId?: 1 | 2; // For vehicles with two drivers
+  agentCommission?: number; // Specific commission for 'milho' services
+  observation?: string; // Observação do motorista
 }
 
 export interface MonthlyCosts {
@@ -35,6 +38,15 @@ export interface MonthlyCosts {
   overtimeRate?: number;
 }
 
+export interface ClientInfo {
+  name: string;
+  cnpj?: string;
+  contactName?: string;
+  phone?: string;
+  address?: string;
+  email?: string;
+}
+
 export interface MonthRecord {
   id: string;
   vehicleId: string;
@@ -42,6 +54,7 @@ export interface MonthRecord {
   year: number;
   services: ServiceEntry[];
   costs: MonthlyCosts;
+  client?: ClientInfo;
 }
 
 export interface Vehicle {

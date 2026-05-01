@@ -20,12 +20,14 @@
       "properties": {
         "id": { "type": "string" },
         "date": { "type": "string", "format": "date" },
-        "type": { "type": "string", "enum": ["normal", "casada", "milho", "cimento", "armazem", "boa_vista", "gas", "frete_avulso"] },
+        "type": { "type": "string", "enum": ["normal", "casada", "milho", "cimento", "boa_vista", "gas", "frete_avulso"] },
         "quantity": { "type": "number" },
         "unitPrice": { "type": "number" },
         "driverPayment": { "type": "number" },
         "containerSize": { "type": "string" },
-        "overtimeHours": { "type": "number" }
+        "overtimeHours": { "type": "number" },
+        "driverId": { "type": "number", "enum": [1, 2] },
+        "agentCommission": { "type": "number" }
       },
       "required": ["id", "date", "type", "quantity"]
     },

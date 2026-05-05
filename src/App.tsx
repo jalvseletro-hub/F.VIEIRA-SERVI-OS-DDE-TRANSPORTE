@@ -19,7 +19,8 @@ import {
   LogIn,
   LogOut,
   RefreshCw,
-  Building2
+  Building2,
+  Pencil
 } from 'lucide-react';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
@@ -82,7 +83,7 @@ const INITIAL_SETTINGS: CompanySettings = {
 };
 
 // Pre-populated data
-const INITIAL_VEHICLE_ID = 'v1';
+const INITIAL_VEHICLE_ID = '';
 const INITIAL_VEHICLES: Vehicle[] = [];
 const INITIAL_SERVICES: ServiceEntry[] = [];
 const INITIAL_RECORDS: MonthRecord[] = [];
@@ -99,11 +100,16 @@ const PRICES = {
 };
 
 const getServiceRevenue = (s: ServiceEntry) => {
-  if (s.type === 'gas' && s.gasItems && s.gasItems.length > 0) {
-    return s.gasItems.reduce((acc, item) => acc + (item.quantity * item.unitPrice), 0);
+  let baseRevenue = 0;
+  if (s.type === 'aleatorio') {
+    baseRevenue = -(s.quantity * (s.unitPrice || 0));
+  } else if (s.type === 'gas' && s.gasItems && s.gasItems.length > 0) {
+    baseRevenue = s.gasItems.reduce((acc, item) => acc + (item.quantity * item.unitPrice), 0);
+  } else {
+    const price = (s.type === 'milho' || s.type === 'cimento' || s.type === 'gas' || s.type === 'frete_avulso') ? (s.unitPrice || 0) : PRICES[s.type as keyof typeof PRICES];
+    baseRevenue = (s.quantity || 0) * price;
   }
-  const price = (s.type === 'milho' || s.type === 'cimento' || s.type === 'gas' || s.type === 'frete_avulso' || s.type === 'aleatorio') ? (s.unitPrice || 0) : PRICES[s.type as keyof typeof PRICES];
-  return s.quantity * price;
+  return baseRevenue;
 };
 
 interface ErrorBoundaryProps {
@@ -126,7 +132,7 @@ class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
     return { hasError: true, errorInfo: error.message };
   }
 
-  componentDidCatch(error: any, errorInfo: any) {
+  componentCatch(error: any, errorInfo: any) {
     console.error("ErrorBoundary caught an error", error, errorInfo);
   }
 
@@ -181,7 +187,10 @@ export default function App() {
   const [forceReady, setForceReady] = useState(false);
 
   useEffect(() => {
-    const timer = setTimeout(() => setForceReady(true), 5000);
+    const timer = setTimeout(() => {
+      setForceReady(true);
+      setIsAuthReady(true); // Safety fallback for auth ready state
+    }, 4000);
     return () => clearTimeout(timer);
   }, []);
 
@@ -201,7 +210,22 @@ export default function App() {
   const [showNewVehicleModal, setShowNewVehicleModal] = useState(false);
   const [editingVehicleId, setEditingVehicleId] = useState<string | null>(null);
   const [recordToDelete, setRecordToDelete] = useState<string | null>(null);
+  const [editingService, setEditingService] = useState<{recordId: string, service: ServiceEntry} | null>(null);
+  const [showAddService, setShowAddService] = useState(false);
 
+  // Auto-select latest record for selected vehicle if none selected
+  useEffect(() => {
+    if (selectedVehicleId && !selectedRecordId && dataLoaded.records) {
+      const vRecords = records
+        .filter(r => r.vehicleId === selectedVehicleId)
+        .sort((a, b) => b.year - a.year || b.month - a.month);
+      
+      if (vRecords.length > 0) {
+        setSelectedRecordId(vRecords[0].id);
+      }
+    }
+  }, [selectedVehicleId, selectedRecordId, dataLoaded.records, records]);
+  
   // Auth Listener
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
@@ -228,12 +252,21 @@ export default function App() {
       const data = snapshot.docs.map(doc => doc.data() as Vehicle);
       setVehicles(data);
       
-      // Lock selection for drivers
-      if (currentUserVehicleId) {
-        setSelectedVehicleId(currentUserVehicleId);
-      } else if (data.length > 0 && !selectedVehicleId) {
-        setSelectedVehicleId(data[0].id);
-      }
+      // Select vehicle logically
+      setSelectedVehicleId(prevId => {
+        // 1. If it's a driver, always use their assigned vehicle
+        if (currentUserVehicleId) return currentUserVehicleId;
+        
+        // 2. If we have vehicles and the current ID is empty or not in the list, pick the first one
+        if (data.length > 0) {
+          const exists = data.some(v => v.id === prevId);
+          if (!prevId || prevId === 'v1' || !exists) {
+            return data[0].id;
+          }
+        }
+        
+        return prevId;
+      });
       
       setDataLoaded(prev => ({ ...prev, vehicles: true }));
     }, (error) => handleFirestoreError(error, OperationType.LIST, 'vehicles', false));
@@ -368,79 +401,85 @@ export default function App() {
   };
 
   const calculateCosts = (record: MonthRecord) => {
-    const revenue = calculateRevenue(record);
+    const revenue = record.services.reduce((acc, s) => acc + getServiceRevenue(s), 0);
     
-    // Revenue subject to tax (excluding 'milho', 'gas', and 'frete_avulso')
+    const aleatorioImpact = record.services.reduce((acc, s) => {
+      if (s.type === 'aleatorio') {
+        return acc + (s.quantity * (s.unitPrice || 0)) + (s.driverPayment || 0);
+      }
+      return acc;
+    }, 0);
+
+    // Revenue subject to tax
     const taxableRevenue = record.services.reduce((acc, s) => {
-      if (s.type === 'milho' || s.type === 'gas' || s.type === 'frete_avulso') return acc;
-      const price = s.type === 'cimento' ? (s.unitPrice || 0) : PRICES[s.type];
+      if (s.type === 'milho' || s.type === 'gas' || s.type === 'frete_avulso' || s.type === 'aleatorio') return acc;
+      const price = s.type === 'cimento' ? (s.unitPrice || 0) : PRICES[s.type as keyof typeof PRICES];
       return acc + (s.quantity * price);
     }, 0);
 
     const diesel = record.costs.dieselLiters * record.costs.dieselPrice;
     
-    // Driver stats calculation per driver
-    const getDriverStats = (dId: number) => {
-      const driverServices = record.services.filter(s => (s.driverId || 1) === dId);
-      const uniqueDates = Array.from(new Set(driverServices.map(s => s.date)));
-      
-      let totalCost = 0;
-      uniqueDates.forEach(date => {
-        const dayServices = driverServices.filter(s => s.date === date);
-        const dayCustomPayment = dayServices.reduce((acc, s) => acc + (s.driverPayment || 0), 0);
-        
-        // Cost for this day is the cumulative custom payment if provided, otherwise the daily rate
-        totalCost += dayCustomPayment > 0 ? dayCustomPayment : record.costs.driverDailyRate;
+    const driver1Services = record.services.filter(s => (s.driverId || 1) === 1);
+    const driver2Services = record.services.filter(s => (s.driverId || 1) === 2);
+    
+    const getDriverDailyEarnings = (services: ServiceEntry[]) => {
+      const dates = Array.from(new Set(services.map(s => s.date)));
+      let total = 0;
+      dates.forEach(date => {
+        const dayServices = services.filter(s => s.date === date);
+        const customPayment = dayServices.reduce((acc, s) => acc + (s.driverPayment || 0), 0);
+        // Se houver algum valor digitado, usa ele. Se não, usa a diária padrão.
+        total += customPayment > 0 ? customPayment : record.costs.driverDailyRate;
       });
-      
-      return {
-        days: uniqueDates.length,
-        cost: totalCost
-      };
+      return { total, days: dates.length };
     };
 
-    const d1Stats = getDriverStats(1);
-    const d2Stats = getDriverStats(2);
+    const d1 = getDriverDailyEarnings(driver1Services);
+    const d2 = getDriverDailyEarnings(driver2Services);
     
-    const driver1Days = d1Stats.days;
-    const driver2Days = d2Stats.days;
-    const driver1TotalCost = d1Stats.cost;
-    const driver2TotalCost = d2Stats.cost;
-
-    // Use manual driverDays fallback if no days calculated from services
+    const driver1Days = d1.days;
+    const driver2Days = d2.days;
+    const driver1TotalEarnings = d1.total;
+    const driver2TotalEarnings = d2.total;
+    
     const totalDriverDaysCalculated = driver1Days + driver2Days;
-    const effectiveDriverDays = totalDriverDaysCalculated > 0 ? totalDriverDaysCalculated : record.costs.driverDays;
-    
     const overtime = (record.costs.overtimeHours || 0) * (record.costs.overtimeRate || 0);
     
-    // Total driver balance (standard/custom days + overtime)
-    const driverBase = totalDriverDaysCalculated > 0 ? (driver1TotalCost + driver2TotalCost) : (record.costs.driverDays * record.costs.driverDailyRate);
+    // Se não houver serviços lançados, usa o padrão das configurações do registro
+    const driverBase = totalDriverDaysCalculated > 0 
+      ? (driver1TotalEarnings + driver2TotalEarnings)
+      : record.costs.driverDays * record.costs.driverDailyRate;
+      
     const driver = driverBase + overtime;
     
     const maintenance = record.costs.maintenanceParts + record.costs.maintenanceLabor;
+    
     const vehicle = vehicles.find(v => v.id === record.vehicleId);
     const isAtego = vehicle?.name.includes('Atego 2425');
     
     const agentCommissions = record.services.reduce((acc, s) => acc + (s.agentCommission || 0), 0);
     const ategoExtras = isAtego ? record.services.reduce((acc, s) => acc + (s.helperCost || 0) + (s.lunchCost || 0) + (s.portCost || 0), 0) : 0;
-    const extraCosts = ategoExtras + agentCommissions;
-
+    
+    const pureExtraCosts = ategoExtras + agentCommissions;
     const taxes = (taxableRevenue * record.costs.taxRate) / 100;
-    const total = diesel + driver + maintenance + taxes + extraCosts;
+    
+    const total = diesel + driver + maintenance + taxes + pureExtraCosts; 
     const profit = revenue - total;
     const margin = revenue > 0 ? (profit / revenue) * 100 : 0;
     
     return {
+      revenue,
+      aleatorioImpact,
       diesel,
       driver,
       driverBase,
       driver1Days,
       driver2Days,
-      driver1TotalCost,
-      driver2TotalCost,
+      driver1TotalCost: driver1TotalEarnings,
+      driver2TotalCost: driver2TotalEarnings,
       overtime,
       maintenance,
-      extraCosts,
+      extraCosts: pureExtraCosts,
       agentCommissions,
       taxes,
       total,
@@ -448,6 +487,8 @@ export default function App() {
       margin
     };
   };
+
+  const stats = activeRecord ? calculateCosts(activeRecord) : null;
 
   const chartData = vehicleRecords.slice(0, 6).reverse().map(r => ({
     name: format(new Date(r.year, r.month), 'MMM', { locale: ptBR }),
@@ -547,10 +588,10 @@ export default function App() {
 
     if (stats.driver1Days > 0 || stats.driver2Days > 0) {
       if (stats.driver1Days > 0) {
-        summaryRows.push([`Diárias Motorista 1 (${stats.driver1Days} dias)`, formatCurrency(stats.driver1TotalCost)]);
+        summaryRows.push([`Diárias Motorista 1 (${stats.driver1Days} dias)`, formatCurrency((stats as any).driver1TotalCost)]);
       }
       if (stats.driver2Days > 0) {
-        summaryRows.push([`Diárias Motorista 2 (${stats.driver2Days} dias)`, formatCurrency(stats.driver2TotalCost)]);
+        summaryRows.push([`Diárias Motorista 2 (${stats.driver2Days} dias)`, formatCurrency((stats as any).driver2TotalCost)]);
       }
     } else {
       summaryRows.push([`Diárias Motorista (${record.costs.driverDays} dias)`, formatCurrency(stats.driverBase)]);
@@ -608,7 +649,7 @@ export default function App() {
           s.driverId || 1,
           s.quantity + (s.overtimeHours ? ` (+${s.overtimeHours}h extra)` : ''),
           formatCurrency((s.type === 'milho' || s.type === 'cimento' || s.type === 'gas' || s.type === 'frete_avulso' || s.type === 'aleatorio') ? (s.unitPrice || 0) : PRICES[s.type]),
-          formatCurrency(s.quantity * ((s.type === 'milho' || s.type === 'cimento' || s.type === 'gas' || s.type === 'frete_avulso' || s.type === 'aleatorio') ? (s.unitPrice || 0) : PRICES[s.type]))
+          formatCurrency(getServiceRevenue(s))
         ];
       }),
       theme: 'grid',
@@ -625,10 +666,7 @@ export default function App() {
       acc[type].count += 1;
       acc[type].quantity += s.quantity;
       
-      const price = (type === 'milho' || type === 'cimento' || type === 'gas' || type === 'frete_avulso') 
-        ? (s.unitPrice || 0) 
-        : PRICES[type];
-      acc[type].revenue += (s.quantity * price);
+      acc[type].revenue += getServiceRevenue(s);
       
       if (type === 'gas') {
         if (s.gasItems) {
@@ -671,6 +709,10 @@ export default function App() {
     }
     if (serviceSummary['frete_avulso']) {
       summaryBody.push(['Frete Avulso', `${serviceSummary['frete_avulso'].count} Serviços\nReceita: ${formatCurrency(serviceSummary['frete_avulso'].revenue)}`]);
+    }
+    if (serviceSummary['aleatorio']) {
+      const aleatorioCostValue = record.services.reduce((acc, s) => s.type === 'aleatorio' ? acc + (s.quantity * (s.unitPrice || 0)) + (s.driverPayment || 0) : acc, 0);
+      summaryBody.push(['Aleatório (Ajuste)', `${serviceSummary['aleatorio'].count} Lançamentos\nSaída Total: ${formatCurrency(aleatorioCostValue)}`]);
     }
 
     if (summaryBody.length > 0) {
@@ -833,7 +875,7 @@ export default function App() {
         s.driverId || 1,
         s.quantity + (s.overtimeHours ? ` (+${s.overtimeHours}h extra)` : ''),
         formatCurrency((s.type === 'milho' || s.type === 'cimento' || s.type === 'gas' || s.type === 'frete_avulso' || s.type === 'aleatorio') ? (s.unitPrice || 0) : PRICES[s.type as keyof typeof PRICES]),
-        formatCurrency(s.quantity * ((s.type === 'milho' || s.type === 'cimento' || s.type === 'gas' || s.type === 'frete_avulso' || s.type === 'aleatorio') ? (s.unitPrice || 0) : PRICES[s.type as keyof typeof PRICES]))
+        formatCurrency(getServiceRevenue(s))
       ]),
       theme: 'striped',
       headStyles: { fillColor: [51, 65, 85], fontStyle: 'bold' },
@@ -1054,12 +1096,60 @@ export default function App() {
     }
   };
 
+  const handleEditService = (recordId: string, service: ServiceEntry) => {
+    setEditingService({ recordId, service });
+    setShowAddService(true);
+  };
+
+  const handleUpdateService = async (service: Omit<ServiceEntry, 'id'>) => {
+    if (!editingService) return;
+    
+    const record = records.find(r => r.id === editingService.recordId);
+    if (!record) return;
+
+    const updatedServices = record.services.map(s => 
+      s.id === editingService.service.id ? { ...service, id: s.id } : s
+    ).sort((a, b) => a.date.localeCompare(b.date));
+
+    const updatedRecord = {
+      ...record,
+      services: updatedServices,
+      costs: {
+        ...record.costs,
+        dieselLiters: updatedServices.reduce((acc, s) => acc + (s.dieselLiters || 0), 0),
+        overtimeHours: updatedServices.reduce((acc, s) => acc + (s.overtimeHours || 0), 0)
+      }
+    };
+
+    const nonTripDates = new Set(updatedRecord.services.filter(s => s.type !== 'boa_vista' && s.type !== 'gas').map(s => s.date));
+    updatedRecord.costs.driverDays = nonTripDates.size;
+
+    try {
+      await setDoc(doc(db, 'records', record.id), cleanObject(updatedRecord));
+      setEditingService(null);
+      setShowAddService(false);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `records/${record.id}`);
+    }
+  };
+
   if (!isAuthReady || (user && !isDataReady)) {
     return (
-      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4 font-sans">
-        <div className="text-white flex flex-col items-center gap-4">
-          <RefreshCw className="animate-spin text-indigo-500" size={40} />
-          <p className="text-slate-400">Carregando sistema...</p>
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4 font-sans text-center">
+        <div className="text-white flex flex-col items-center gap-6">
+          <RefreshCw className="animate-spin text-indigo-500" size={48} />
+          <div className="space-y-2">
+            <p className="text-lg font-medium">Carregando sistema...</p>
+            <p className="text-slate-500 text-sm">Sincronizando seus dados com a nuvem</p>
+          </div>
+          {forceReady && (
+             <button 
+               onClick={() => window.location.reload()}
+               className="mt-4 text-xs text-indigo-400 underline"
+             >
+               Está demorando muito? Clique para recarregar
+             </button>
+          )}
         </div>
       </div>
     );
@@ -1341,27 +1431,34 @@ export default function App() {
                   selectedVehicleId={selectedVehicleId}
                   onAdd={handleQuickAddService} 
                   isDriver={isDriver}
+                  editingService={editingService?.service}
+                  onEdit={handleUpdateService}
+                  onCancel={() => {
+                    setEditingService(null);
+                  }}
                 />
                 {/* Stats Grid */}
                 {isAdmin && (
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                     <StatCard 
-                      title="Receita Bruta" 
-                      value={formatCurrency(calculateRevenue(activeRecord))} 
+                      title="Receita Líquida" 
+                      value={formatCurrency(stats.revenue)} 
                       icon={<TrendingUp className="text-emerald-600" />}
-                      subtitle={`${activeRecord.services.length} cargas lançadas`}
+                      subtitle={stats.aleatorioImpact > 0 
+                        ? `Ajuste: -${formatCurrency(stats.aleatorioImpact)}` 
+                        : `${activeRecord.services.length} cargas lançadas`}
                       color="emerald"
                     />
                     <StatCard 
                       title="Custos Operacionais" 
-                      value={formatCurrency(calculateCosts(activeRecord).total)} 
+                      value={formatCurrency(stats.total + stats.aleatorioImpact)} 
                       icon={<TrendingDown className="text-rose-600" />}
-                      subtitle={`${calculateCosts(activeRecord).margin.toFixed(1)}% de margem`}
+                      subtitle={`${stats.margin.toFixed(1)}% de margem br.`}
                       color="rose"
                     />
                     <StatCard 
                       title="Lucro Líquido" 
-                      value={formatCurrency(calculateCosts(activeRecord).profit)} 
+                      value={formatCurrency(stats.profit)} 
                       icon={<DollarSign className="text-indigo-600" />}
                       subtitle="Resultado final"
                       color="indigo"
@@ -1426,15 +1523,16 @@ export default function App() {
                           <PieChart>
                             <Pie
                               data={[
-                                { name: 'Diesel', value: stats.diesel },
-                                ...(stats.driver1Days > 0 ? [{ name: 'Mot. 1', value: stats.driver1TotalCost }] : []),
-                                ...(stats.driver2Days > 0 ? [{ name: 'Mot. 2', value: stats.driver2TotalCost }] : []),
-                                ...(stats.driver1Days === 0 && stats.driver2Days === 0 ? [{ name: 'Motorista', value: stats.driverBase }] : []),
-                                { name: 'Horas Extras', value: stats.overtime },
-                                { name: 'Manutenção', value: stats.maintenance },
-                                { name: 'Impostos', value: stats.taxes },
-                                { name: 'Extras', value: stats.extraCosts },
-                              ]}
+                                { name: 'Diesel', value: stats.diesel, color: '#0f172a' },
+                                ...(stats.driver1Days > 0 ? [{ name: 'Motorista 1', value: stats.driver1TotalCost, color: '#16a34a' }] : []),
+                                ...(stats.driver2Days > 0 ? [{ name: 'Motorista 2', value: stats.driver2TotalCost, color: '#ca8a04' }] : []),
+                                ...(stats.driver1Days === 0 && stats.driver2Days === 0 ? [{ name: 'Motorista', value: stats.driverBase, color: '#16a34a' }] : []),
+                                { name: 'Horas Extras', value: stats.overtime, color: '#facc15' },
+                                { name: 'Manutenção', value: stats.maintenance, color: '#ea580c' },
+                                { name: 'Impostos (Fixo)', value: stats.taxes, color: '#dc2626' },
+                                { name: 'Aleatório', value: stats.aleatorioImpact, color: '#f59e0b' },
+                                { name: 'Custos Extras', value: stats.extraCosts, color: '#8b5cf6' },
+                              ].filter(d => d.value > 0)}
                               cx="50%"
                               cy="50%"
                               innerRadius={60}
@@ -1442,12 +1540,19 @@ export default function App() {
                               paddingAngle={5}
                               dataKey="value"
                             >
-                              <Cell fill="#4f46e5" />
-                              <Cell fill="#06b6d4" />
-                              <Cell fill="#38bdf8" />
-                              <Cell fill="#f59e0b" />
-                              <Cell fill="#f43f5e" />
-                              <Cell fill="#8b5cf6" />
+                              {[
+                                { name: 'Diesel', value: stats.diesel, color: '#0f172a' },
+                                ...(stats.driver1Days > 0 ? [{ name: 'Motorista 1', value: stats.driver1TotalCost, color: '#16a34a' }] : []),
+                                ...(stats.driver2Days > 0 ? [{ name: 'Motorista 2', value: stats.driver2TotalCost, color: '#ca8a04' }] : []),
+                                ...(stats.driver1Days === 0 && stats.driver2Days === 0 ? [{ name: 'Motorista', value: stats.driverBase, color: '#16a34a' }] : []),
+                                { name: 'Horas Extras', value: stats.overtime, color: '#facc15' },
+                                { name: 'Manutenção', value: stats.maintenance, color: '#ea580c' },
+                                { name: 'Impostos (Fixo)', value: stats.taxes, color: '#dc2626' },
+                                { name: 'Aleatório', value: stats.aleatorioImpact, color: '#f59e0b' },
+                                { name: 'Custos Extras', value: stats.extraCosts, color: '#8b5cf6' },
+                              ].filter(d => d.value > 0).map((entry, index) => (
+                                <Cell key={`cell-${index}`} fill={entry.color} />
+                              ))}
                             </Pie>
                             <Tooltip 
                               formatter={(value: number) => formatCurrency(value)}
@@ -1458,25 +1563,39 @@ export default function App() {
                         </ResponsiveContainer>
                       </div>
                         <div className="mt-4 space-y-3">
-                          <CostItem label="Diesel" value={stats.diesel} color="bg-indigo-600" />
+                          <CostItem label="Diesel" value={stats.diesel} color="bg-slate-900" />
                           
                           {stats.driver1Days > 0 && (
-                            <CostItem label="Motorista 1" value={stats.driver1TotalCost} color="bg-cyan-500" />
+                            <CostItem 
+                              label={`Motorista 1 (${stats.driver1Days} dias)`} 
+                              value={stats.driver1TotalCost} 
+                              color="bg-green-600" 
+                            />
                           )}
+                          
                           {stats.driver2Days > 0 && (
-                            <CostItem label="Motorista 2" value={stats.driver2TotalCost} color="bg-cyan-600" />
-                          )}
-                          {stats.driver1Days === 0 && stats.driver2Days === 0 && (
-                            <CostItem label="Motorista (Diárias)" value={stats.driverBase} color="bg-cyan-500" />
+                            <CostItem 
+                              label={`Motorista 2 (${stats.driver2Days} dias)`} 
+                              value={stats.driver2TotalCost} 
+                              color="bg-amber-600" 
+                            />
                           )}
 
-                          {stats.overtime > 0 && (
-                            <CostItem label="Horas Extras" value={stats.overtime} color="bg-sky-400" />
+                          {stats.driver1Days === 0 && stats.driver2Days === 0 && (
+                            <CostItem label="Motorista (Diárias)" value={stats.driverBase} color="bg-green-600" />
                           )}
-                          <CostItem label="Manutenção" value={stats.maintenance} color="bg-amber-500" />
-                          <CostItem label="Impostos (Exceto Milho)" value={stats.taxes} color="bg-rose-500" />
+                          
+                          {stats.overtime > 0 && (
+                            <CostItem label="Horas Extras" value={stats.overtime} color="bg-yellow-400" />
+                          )}
+                          
+                          <CostItem label="Manutenção" value={stats.maintenance} color="bg-orange-600" />
+                          <CostItem label="Impostos (Fixo)" value={stats.taxes} color="bg-red-600" />
+                          {stats.aleatorioImpact > 0 && (
+                            <CostItem label="Aleatório (Ajuste Rec.)" value={stats.aleatorioImpact} color="bg-amber-500" />
+                          )}
                           {stats.extraCosts > 0 && (
-                            <CostItem label="Custos Extras (Comis / Ajudante / Almoço)" value={stats.extraCosts} color="bg-violet-500" />
+                            <CostItem label="Custos Extras" value={stats.extraCosts} color="bg-violet-500" />
                           )}
                         </div>
                     </div>
@@ -1499,8 +1618,8 @@ export default function App() {
                         <tr className="bg-slate-50 text-slate-500 text-xs uppercase font-bold tracking-wider">
                           <th className="px-6 py-4">Data</th>
                           <th className="px-6 py-4">Tipo</th>
-                          <th className="px-6 py-4">Quantidade</th>
-                          {isAdmin && <th className="px-6 py-4">Valor</th>}
+                          <th className="px-6 py-4">Qtd</th>
+                          {isAdmin && <th className="px-6 py-4 text-right">Total</th>}
                           <th className="px-6 py-4 text-right">Ação</th>
                         </tr>
                       </thead>
@@ -1531,13 +1650,13 @@ export default function App() {
                               </span>
                             </td>
                             <td className="px-6 py-4 text-sm text-slate-600 whitespace-nowrap">
-                              {s.quantity} {(s.type === 'milho' || s.type === 'cimento' || s.type === 'aleatorio') ? 'cargas/sacas' : 'unid.'}
-                              {s.containerSize && (
+                              {s.quantity} {(s.type === 'milho' || s.type === 'cimento' || s.type === 'aleatorio') ? (s.type === 'milho' ? 'sacas' : 'cargas/sacas') : 'unid.'}
+                              {s.containerSize ? (
                                 <span className="text-[10px] text-orange-600 block font-bold">
                                   Tam: {s.containerSize}
                                 </span>
-                              )}
-                              {s.gasItems && s.gasItems.length > 0 && (
+                              ) : null}
+                              {s.gasItems && s.gasItems.length > 0 ? (
                                 <div className="mt-1 space-y-0.5">
                                   {s.gasItems.map(item => (
                                     <span key={item.id} className="text-[9px] text-orange-600 block leading-tight">
@@ -1545,42 +1664,59 @@ export default function App() {
                                     </span>
                                   ))}
                                 </div>
-                              )}
-                              {isAdmin && s.driverPayment && (
+                              ) : null}
+                              {isAdmin && s.driverPayment ? (
                                 <span className="text-[10px] text-indigo-500 block font-bold">
                                   Pagto: {formatCurrency(s.driverPayment)}
                                 </span>
-                              )}
+                              ) : null}
+                              {s.dieselLiters ? (
+                                <span className="text-[10px] text-blue-600 block font-bold">
+                                  Diesel: {s.dieselLiters}L ({s.dieselLiters / 20} baldes)
+                                </span>
+                              ) : null}
                               {s.overtimeHours ? (
                                 <span className="text-[10px] text-emerald-600 block font-bold">
                                   H. Extra: {s.overtimeHours}h
                                 </span>
                               ) : null}
-                              {s.observation && (
-                                <span className="text-[10px] text-slate-400 block italic mt-1 bg-slate-50 p-1 rounded border border-slate-100">
+                              {s.observation ? (
+                                <span className="text-[10px] text-slate-500 block italic mt-1 bg-slate-50 p-1.5 rounded border border-slate-100 whitespace-normal break-words max-w-[200px]">
                                   Obs: {s.observation}
                                 </span>
-                              )}
+                              ) : null}
                             </td>
                             {isAdmin && (
-                              <td className="px-6 py-4 text-sm font-bold whitespace-nowrap text-slate-900">
+                              <td className="px-6 py-4 text-sm font-bold whitespace-nowrap text-slate-900 border-l border-slate-50">
                                 {formatCurrency(getServiceRevenue(s))}
-                                {(s.type === 'milho' || s.type === 'cimento' || (s.type === 'gas' && !s.gasItems)) && s.unitPrice && (
+                                {((s.type === 'milho' || s.type === 'cimento' || s.type === 'frete_avulso' || s.type === 'aleatorio' || (s.type === 'gas' && !s.gasItems)) && s.unitPrice) ? (
                                   <span className="text-[10px] text-slate-400 block font-normal">
                                     ({formatCurrency(s.unitPrice)}/unid)
                                   </span>
-                                )}
+                                ) : null}
                               </td>
                             )}
-                            <td className="px-6 py-4 text-right">
-                              {isAdmin && (
-                                <button 
-                                  onClick={() => handleDeleteService(activeRecord.id, s.id)}
-                                  className="p-1.5 text-slate-300 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-all opacity-0 group-hover:opacity-100"
-                                >
-                                  <Trash2 size={16} />
-                                </button>
-                              )}
+                            <td className="px-6 py-4 text-right border-l border-slate-50">
+                              <div className="flex items-center justify-end gap-1">
+                                {isAdmin && (
+                                  <>
+                                    <button 
+                                      onClick={() => handleEditService(activeRecord.id, s)}
+                                      className="p-2 text-indigo-600 hover:bg-indigo-50 rounded-lg transition-all active:scale-95"
+                                      title="Editar Registro"
+                                    >
+                                      <Pencil size={18} />
+                                    </button>
+                                    <button 
+                                      onClick={() => handleDeleteService(activeRecord.id, s.id)}
+                                      className="p-2 text-rose-500 hover:bg-rose-50 rounded-lg transition-all active:scale-95"
+                                      title="Excluir Registro"
+                                    >
+                                      <Trash2 size={18} />
+                                    </button>
+                                  </>
+                                )}
+                              </div>
                             </td>
                           </tr>
                         ))}
@@ -2063,21 +2199,24 @@ function GasItemsModal({ items, onSave, onClose }: {
   );
 }
 
-function QuickAddService({ vehicles, selectedVehicleId, onAdd, isDriver }: { 
+function QuickAddService({ vehicles, selectedVehicleId, onAdd, isDriver, editingService, onEdit, onCancel }: { 
   vehicles: Vehicle[];
   selectedVehicleId: string;
   onAdd: (s: Omit<ServiceEntry, 'id'>) => void;
   isDriver?: boolean;
+  editingService?: ServiceEntry | null;
+  onEdit?: (s: Omit<ServiceEntry, 'id'>) => void;
+  onCancel?: () => void;
 }) {
   const [date, setDate] = useState(format(new Date(), 'yyyy-MM-dd'));
   const [type, setType] = useState<ServiceType>('normal');
   const [qty, setQty] = useState<string>('1');
   const [unitPrice, setUnitPrice] = useState<string>('0');
-  const [driverPayment, setDriverPayment] = useState<string>('0');
+  const [driverPayment, setDriverPayment] = useState<string>('');
   const [containerSize, setContainerSize] = useState<string>('13kg');
   const [gasItems, setGasItems] = useState<GasItem[]>([]);
   const [showGasModal, setShowGasModal] = useState(false);
-  const [helperCost, setHelperCost] = useState<string>('140'); // 2 helpers * 70
+  const [helperCost, setHelperCost] = useState<string>('140'); 
   const [lunchCost, setLunchCost] = useState<string>('60');
   const [portCost, setPortCost] = useState<string>('0');
   const [dieselBuckets, setDieselBuckets] = useState<string>('0');
@@ -2085,6 +2224,37 @@ function QuickAddService({ vehicles, selectedVehicleId, onAdd, isDriver }: {
   const [driverId, setDriverId] = useState<1 | 2>(1);
   const [agentCommission, setAgentCommission] = useState<string>('0');
   const [observation, setObservation] = useState<string>('');
+
+  useEffect(() => {
+    if (editingService) {
+      setDate(editingService.date);
+      setType(editingService.type);
+      setQty(editingService.quantity.toString());
+      setUnitPrice(editingService.unitPrice?.toString() || '0');
+      setDriverPayment(editingService.driverPayment && editingService.driverPayment !== 0 ? editingService.driverPayment.toString() : '');
+      setContainerSize(editingService.containerSize || '13kg');
+      setGasItems(editingService.gasItems || []);
+      setHelperCost(editingService.helperCost?.toString() || '140');
+      setLunchCost(editingService.lunchCost?.toString() || '60');
+      setPortCost(editingService.portCost?.toString() || '0');
+      setDieselBuckets(editingService.dieselLiters ? (editingService.dieselLiters / 20).toString() : '0');
+      setOvertimeHours(editingService.overtimeHours?.toString() || '0');
+      setDriverId(editingService.driverId || 1);
+      setAgentCommission(editingService.agentCommission?.toString() || '0');
+      setObservation(editingService.observation || '');
+    } else {
+      setDate(format(new Date(), 'yyyy-MM-dd'));
+      setType('normal');
+      setQty('1');
+      setUnitPrice('0');
+      setDriverPayment('');
+      setAgentCommission('0');
+      setObservation('');
+      setGasItems([]);
+      setDieselBuckets('0');
+      setOvertimeHours('0');
+    }
+  }, [editingService, selectedVehicleId]);
 
   const handleAdd = () => {
     const totalQty = type === 'gas' && gasItems.length > 0 
@@ -2094,12 +2264,12 @@ function QuickAddService({ vehicles, selectedVehicleId, onAdd, isDriver }: {
     const isAtego = vehicles.find(v => v.id === selectedVehicleId)?.name.includes('Atego 2425');
     const isConstellation = vehicles.find(v => v.id === selectedVehicleId)?.name.includes('Constellation 30280');
 
-    onAdd({ 
+    const serviceData: Omit<ServiceEntry, 'id'> = { 
       date, 
       type, 
       quantity: totalQty, 
       unitPrice: (type === 'milho' || type === 'cimento' || type === 'frete_avulso' || type === 'aleatorio' || (type === 'gas' && gasItems.length === 0)) ? (parseFloat(unitPrice) || 0) : undefined,
-      driverPayment: (type === 'boa_vista' || type === 'gas' || isConstellation) ? (parseFloat(driverPayment) || 0) : undefined,
+      driverPayment: (type === 'boa_vista' || type === 'gas' || isConstellation || type === 'milho' || type === 'cimento' || type === 'aleatorio' || type === 'frete_avulso') ? (parseFloat(driverPayment) || 0) : undefined,
       containerSize: (type === 'gas' && gasItems.length === 0) ? containerSize : undefined,
       gasItems: type === 'gas' && gasItems.length > 0 ? gasItems : undefined,
       helperCost: isAtego ? (parseFloat(helperCost) || 0) : 0,
@@ -2110,13 +2280,19 @@ function QuickAddService({ vehicles, selectedVehicleId, onAdd, isDriver }: {
       driverId,
       agentCommission: type === 'milho' ? (parseFloat(agentCommission) || 0) : undefined,
       observation: observation.trim() || undefined
-    });
-    setGasItems([]);
-    setDieselBuckets('0');
-    setOvertimeHours('0');
-    setAgentCommission('0');
-    setDriverPayment('0');
-    setObservation('');
+    };
+
+    if (editingService && onEdit) {
+      onEdit(serviceData);
+    } else {
+      onAdd(serviceData);
+      setGasItems([]);
+      setDieselBuckets('0');
+      setOvertimeHours('0');
+      setAgentCommission('0');
+      setDriverPayment('');
+      setObservation('');
+    }
   };
 
   return (
@@ -2290,12 +2466,28 @@ function QuickAddService({ vehicles, selectedVehicleId, onAdd, isDriver }: {
             className="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-2 text-sm outline-none focus:bg-white/20 transition-all font-medium placeholder:text-white/30"
           />
         </div>
-        <div className="flex items-end">
+        <div className="flex items-end gap-2">
+          {editingService && (
+            <button 
+              onClick={onCancel}
+              className="px-4 bg-white/10 hover:bg-white/20 text-white font-bold text-sm h-[38px] rounded-xl transition-colors"
+            >
+              Cancelar
+            </button>
+          )}
           <button 
             onClick={handleAdd}
-            className="w-full bg-white text-indigo-900 font-bold text-sm h-[38px] rounded-xl hover:bg-indigo-50 transition-colors"
+            className={cn(
+              "flex-1 md:w-auto font-bold text-sm h-[38px] px-6 rounded-xl transition-all flex items-center justify-center gap-2",
+              editingService ? "bg-amber-500 hover:bg-amber-600 text-white shadow-lg shadow-amber-500/20" : "bg-white text-indigo-900 hover:bg-indigo-50 transition-colors"
+            )}
           >
-            Lançar
+            {editingService ? (
+              <>
+                <Pencil size={16} />
+                Salvar
+              </>
+            ) : 'Lançar'}
           </button>
         </div>
       </div>
@@ -2801,21 +2993,33 @@ function RecordModal({ vehicleId, vehicles, record, onClose, onSubmit }: {
                       <tr key={s.id} className="text-sm">
                         <td className="px-4 py-3">{format(parseISO(s.date), 'dd/MM/yyyy')}</td>
                         <td className="px-4 py-3">
-                          {s.type === 'casada' ? 'Casada' : 
-                           s.type === 'normal' ? 'Normal' : 
-                           s.type === 'milho' ? 'Milho' : 
-                           s.type === 'boa_vista' ? 'Boa Vista' : 
-                           s.type === 'gas' ? 'Gás' : 
-                           s.type === 'frete_avulso' ? 'Frete Avulso' : 'Cimento'}
+                          <span className={cn(
+                            "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-tight",
+                            s.type === 'casada' ? "bg-indigo-100 text-indigo-700" : 
+                            s.type === 'normal' ? "bg-cyan-100 text-cyan-700" : 
+                            s.type === 'milho' ? "bg-amber-100 text-amber-700" : 
+                            s.type === 'boa_vista' ? "bg-emerald-100 text-emerald-700" : 
+                            s.type === 'gas' ? "bg-orange-100 text-orange-700" : 
+                            s.type === 'aleatorio' ? "bg-pink-100 text-pink-700" :
+                            s.type === 'frete_avulso' ? "bg-purple-100 text-purple-700" : "bg-slate-100 text-slate-700"
+                          )}>
+                            {s.type === 'casada' ? 'Casada' : 
+                             s.type === 'normal' ? 'Normal' : 
+                             s.type === 'milho' ? 'Milho' : 
+                             s.type === 'boa_vista' ? 'Boa Vista' : 
+                             s.type === 'gas' ? 'Gás' : 
+                             s.type === 'frete_avulso' ? 'Frete Avulso' : 
+                             s.type === 'aleatorio' ? 'Aleatório' : 'Cimento'}
+                          </span>
                         </td>
                         <td className="px-4 py-3">
-                          {s.quantity} {(s.type === 'milho' || s.type === 'cimento') ? 'sacas' : 'unid.'}
-                          {s.containerSize && (
+                          {s.quantity} {(s.type === 'milho' || s.type === 'cimento' || s.type === 'aleatorio') ? (s.type === 'milho' ? 'sacas' : 'cargas/sacas') : 'unid.'}
+                          {s.containerSize ? (
                             <span className="text-[10px] text-orange-600 block font-bold">
                               Tam: {s.containerSize}
                             </span>
-                          )}
-                          {s.gasItems && s.gasItems.length > 0 && (
+                          ) : null}
+                          {s.gasItems && s.gasItems.length > 0 ? (
                             <div className="mt-1 space-y-0.5">
                               {s.gasItems.map(item => (
                                 <span key={item.id} className="text-[9px] text-orange-600 block leading-tight">
@@ -2823,17 +3027,17 @@ function RecordModal({ vehicleId, vehicles, record, onClose, onSubmit }: {
                                 </span>
                               ))}
                             </div>
-                          )}
-                          {s.driverPayment && (
+                          ) : null}
+                          {s.driverPayment ? (
                             <span className="text-[10px] text-indigo-500 block font-bold">
                               Pagto: {formatCurrency(s.driverPayment)}
                             </span>
-                          )}
-                          {(s.type === 'milho' || s.type === 'cimento' || s.type === 'frete_avulso' || (s.type === 'gas' && !s.gasItems)) && s.unitPrice && (
+                          ) : null}
+                          {(s.type === 'milho' || s.type === 'cimento' || s.type === 'frete_avulso' || s.type === 'aleatorio' || (s.type === 'gas' && !s.gasItems)) && s.unitPrice ? (
                             <span className="text-[10px] text-slate-400 block">
                               ({formatCurrency(s.unitPrice)}/unid)
                             </span>
-                          )}
+                          ) : null}
                           {(s.helperCost || s.lunchCost || s.portCost) && vehicles.find(v => v.id === record?.vehicleId)?.name.includes('Atego 2425') ? (
                             <div className="mt-1 pt-1 border-t border-slate-50">
                               {s.helperCost ? <span className="text-[9px] text-rose-500 block">Ajudantes: {formatCurrency(s.helperCost)}</span> : null}
